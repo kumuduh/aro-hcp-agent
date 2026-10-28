@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Run state (captured resource IDs and step outcomes)
+.aro-hcp/
+
+# Test caches
+.pytest_cache/
+
+# Your own cluster config. cluster.example.yaml is the committed sample;
+# `aro-hcp init` writes cluster.yaml, which names real resources in a real
+# subscription and should not be shared by accident.
+cluster.yaml

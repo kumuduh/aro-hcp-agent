@@ -1,0 +1,37 @@
+[project]
+name = "aro-hcp"
+version = "0.1.0"
+description = "Agent that provisions Azure Red Hat OpenShift clusters with hosted control planes"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Kumudu Herath", email = "kumuduh@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Only `aro-hcp agent` needs the SDK, and it imports it lazily. Everyone
+# driving the deterministic subcommands skips the install.
+agent = ["anthropic>=0.69"]
+
+[project.urls]
+Homepage = "https://github.com/kumuduh/aro-hcp-agent"
+Issues = "https://github.com/kumuduh/aro-hcp-agent/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    # The agent guardrail tests exercise build_tools(), which needs the SDK.
+    "anthropic>=0.69",
+]
+
+[project.scripts]
+aro-hcp = "aro_hcp:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"

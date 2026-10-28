@@ -1,0 +1,163 @@
+"""Thin, testable wrapper around the `az` CLI."""
+
+from __future__ import annotations
+
+import json
+import shlex
+import shutil
+import subprocess
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+
+DEFAULT_TIMEOUT = 300
+# `az aro hcp cluster create` routinely runs 15-20 minutes.
+LONG_TIMEOUT = 2700
+
+# Command groups that must not carry --subscription.
+_NO_SUBSCRIPTION = {"account", "extension", "login", "logout"}
+
+
+class AzNotFound(RuntimeError):
+    """The `az` CLI is not on PATH."""
+
+
+@dataclass
+class AzResult:
+    args: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+    @property
+    def text(self) -> str:
+        return self.stdout.strip()
+
+    def json(self):
+        if not self.text:
+            return None
+        return json.loads(self.text)
+
+    @property
+    def command(self) -> str:
+        return " ".join(shlex.quote(a) for a in self.args)
+
+
+class AzError(RuntimeError):
+    def __init__(self, result: AzResult):
+        self.result = result
+        detail = result.stderr.strip() or result.stdout.strip() or "(no output)"
+        super().__init__(f"`{result.command}` exited {result.returncode}: {detail}")
+
+
+class AzCli:
+    """Runs `az` commands, optionally in dry-run mode.
+
+    In dry-run mode no process is spawned: every call returns an empty
+    successful result, so plan rendering can walk the full step list without
+    touching Azure.
+    """
+
+    def __init__(
+        self,
+        subscription: str | None = None,
+        *,
+        dry_run: bool = False,
+        echo: Callable[[str], None] | None = None,
+    ) -> None:
+        self.subscription = subscription
+        self.dry_run = dry_run
+        self.echo = echo
+        self._log: list[AzResult] = []
+
+    @property
+    def log(self) -> list[AzResult]:
+        return list(self._log)
+
+    def ensure_available(self) -> str:
+        if shutil.which("az") is None:
+            raise AzNotFound(
+                "the `az` CLI was not found on PATH; see "
+                "https://learn.microsoft.com/cli/azure/install-azure-cli"
+            )
+        return shutil.which("az")  # type: ignore[return-value]
+
+    def build(self, args: Sequence[str]) -> list[str]:
+        """Return the full argv for an `az` invocation."""
+        argv = ["az", *args]
+        if not args or args[0].startswith("-"):
+            # Bare flags such as `az --version` take no common arguments.
+            return argv
+        if "--only-show-errors" not in argv:
+            argv.append("--only-show-errors")
+        if (
+            self.subscription
+            and "--subscription" not in argv
+            and args[0] not in _NO_SUBSCRIPTION
+        ):
+            argv += ["--subscription", self.subscription]
+        return argv
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        timeout: int = DEFAULT_TIMEOUT,
+        force: bool = False,
+    ) -> AzResult:
+        """Run an `az` command.
+
+        ``force=True`` runs even in dry-run mode — use it for read-only
+        inspection (``show``/``list``) that a plan needs in order to be accurate.
+        """
+        argv = self.build(args)
+        if self.echo:
+            self.echo(" ".join(shlex.quote(a) for a in argv))
+        if self.dry_run and not force:
+            result = AzResult(argv, 0, "", "")
+            self._log.append(result)
+            return result
+
+        self.ensure_available()
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout, check=False
+            )
+        except subprocess.TimeoutExpired as exc:
+            result = AzResult(argv, 124, exc.stdout or "", f"timed out after {timeout}s")
+            self._log.append(result)
+            if check:
+                raise AzError(result) from exc
+            return result
+
+        result = AzResult(argv, proc.returncode, proc.stdout, proc.stderr)
+        self._log.append(result)
+        if check and not result.ok:
+            raise AzError(result)
+        return result
+
+    # -- convenience --------------------------------------------------------
+
+    def query(self, args: Sequence[str], *, force: bool = True) -> str:
+        """Run a read-only command and return trimmed stdout."""
+        return self.run(args, check=False, force=force).text
+
+    def current_subscription(self) -> str | None:
+        result = self.run(
+            ["account", "show", "--query", "id", "--output", "tsv"],
+            check=False,
+            force=True,
+        )
+        return result.text or None
+
+    def signed_in_user(self) -> str | None:
+        result = self.run(
+            ["account", "show", "--query", "user.name", "--output", "tsv"],
+            check=False,
+            force=True,
+        )
+        return result.text or None

@@ -1,0 +1,99 @@
+# ARO HCP cluster configuration.
+#
+# Procedures this encodes:
+#   az-cli     https://learn.microsoft.com/azure/openshift/howto-create-custom-hosted-cluster?pivots=aro-az-cli
+#   terraform  https://cloud.redhat.com/experts/aro/terraform-hcp/
+#
+# Check it before using it:
+#   uv run aro-hcp validate  -c cluster.yaml   # offline
+#   uv run aro-hcp preflight -c cluster.yaml   # against live Azure
+#   uv run aro-hcp plan      -c cluster.yaml -v
+
+# -- required ---------------------------------------------------------------
+
+cluster_name: kh-demo
+resource_group: kh-demo-rg
+
+# ARO HCP is in preview and offered in a subset of regions. As of 2026-10-26:
+# uksouth, switzerlandnorth, canadacentral, australiaeast, westeurope,
+# centralindia, brazilsouth, eastus2. `preflight` reports the current set.
+location: eastus2
+
+# `az aro hcp get-versions --location <region> --control-plane` lists these.
+# The node pool version must be in the cluster version's minor stream.
+cluster_version: "4.21"
+nodepool_version: "4.21.22"
+
+# -- backend ----------------------------------------------------------------
+# How to build it. Both backends read this same file, but they name the Key
+# Vault and the managed identities differently, so a cluster must be built and
+# torn down by one backend throughout — they cannot manage each other's work.
+#
+#   az-cli     the Microsoft Learn procedure, ~86 az commands, step-level resume
+#   terraform  the upstream rh-mobb module, cloned at a pinned ref
+#
+# Override per run with --backend.
+
+backend: az-cli
+
+# Use your own checkout of the module instead of cloning one. Point it at the
+# `terraform/` directory of validated-pattern-aro-hcp, not the repo root.
+# terraform_dir: /path/to/validated-pattern-aro-hcp/terraform
+
+# -- subscription -----------------------------------------------------------
+
+# Omit to use whatever `az account show` is pointing at.
+# subscription_id: 00000000-0000-0000-0000-000000000000
+
+# -- names ------------------------------------------------------------------
+# All derived from cluster_name when omitted. Shown here as the values this
+# config actually produces, so you can see what will be created.
+
+# nsg_name: kh-demo-nsg
+# vnet_name: kh-demo-vnet
+# worker_subnet_name: worker-subnet
+# vnet_integration_subnet_name: vnet-integration-subnet
+
+# Azure creates and owns this one; it must not already exist, and must differ
+# from resource_group above.
+# managed_resource_group: kh-demo-managed-rg
+
+# The Key Vault holding the etcd encryption key is not configurable: the
+# az-cli backend derives kh-demo-kv from cluster_name, and the terraform
+# module names it cust-kv-<random> and cannot be told otherwise.
+
+# -- networking -------------------------------------------------------------
+# Both subnets must sit inside the VNet prefix and must not overlap.
+# vnet-integration-subnet gets the Microsoft.RedHatOpenShift/hcpOpenShiftClusters
+# delegation; do not reuse it for anything else.
+
+vnet_address_prefix: 10.0.0.0/16
+worker_subnet_prefix: 10.0.0.0/24
+vnet_integration_subnet_prefix: 10.0.1.0/24
+
+# -- visibility -------------------------------------------------------------
+# Public | Private. Private endpoints need your own connectivity (VPN,
+# ExpressRoute, or a jumpbox in a peered VNet) to reach the API afterwards.
+
+api_visibility: Public
+ingress_visibility: Public
+
+# Must agree with the Key Vault's actual network config, or the cluster create
+# rejects the KMS key.
+vault_visibility: Public
+
+# To put the vault behind a private endpoint, pass --keyvault-private-endpoint.
+# It adds the private endpoint, private DNS zone, VNet link and zone group
+# steps, disables public network access on the vault, and forces
+# vault_visibility: Private. az-cli backend only.
+
+# -- node pool --------------------------------------------------------------
+# ARO HCP needs 20+ cores in the VM family; Standard_D8s_v6 x 2 = 16, plus
+# headroom. `preflight` checks your regional quota for the family.
+
+nodepool_name: np-1
+nodepool_replicas: 2
+nodepool_vm_size: Standard_D8s_v6
+
+# Create the cluster only, and add node pools yourself later.
+skip_nodepool: false

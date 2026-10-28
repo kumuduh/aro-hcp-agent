@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml, the latest, and the one in
+        # between — the suite is hermetic, so this costs almost nothing.
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --python ${{ matrix.python }}
+      - run: uv run pytest -q
