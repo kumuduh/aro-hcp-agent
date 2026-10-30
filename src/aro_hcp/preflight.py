@@ -644,10 +644,10 @@ def check_keyvault_name(az: AzCli, config: ClusterConfig) -> Finding:
             )
 
     subscription = config.subscription_id or az.subscription or ""
+    url = (f"https://management.azure.com/subscriptions/{subscription}/providers/"
+           "Microsoft.KeyVault/checkNameAvailability?api-version=2022-07-01")
     check = az.run(
-        ["rest", "--method", "post", "--url",
-         f"https://management.azure.com/subscriptions/{subscription}/providers/"
-         "Microsoft.KeyVault/checkNameAvailability?api-version=2022-07-01",
+        ["rest", "--method", "post", "--url", url,
          "--body", json.dumps({"name": name, "type": "Microsoft.KeyVault/vaults"}),
          "--output", "json"],
         check=False, force=True,
