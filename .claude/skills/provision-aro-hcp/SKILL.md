@@ -34,7 +34,7 @@ One `cluster.yaml`, two ways to build it. Set `backend:` in the config or pass
 | Mirrors | the Microsoft Learn doc, step by step | the upstream `rh-mobb` module |
 | Resume | per step, from the state file | per step, plus Terraform's own state |
 | Preview | the exact commands it would run | a real `terraform plan` diff |
-| Drift detection | no | yes |
+| Drift detection | no — re-apply re-checks each resource exists | yes — fresh `terraform plan` every run |
 
 Pick `az-cli` when the user wants no extra tooling, step-level resume, or a
 run they can compare line by line against the Microsoft doc. Pick `terraform`
@@ -48,9 +48,17 @@ resources differently: the Key Vault is `<cluster>-kv` under `az-cli` and
 (`<cluster>-cp-cluster-api-azure` versus `<cluster>-cluster-api-azure`).
 Terraform cannot adopt what the az path built — it would create a second,
 overlapping set of resources. Whichever backend builds a cluster must also tear
-it down. `apply --backend terraform` refuses outright when the az state file
-shows completed steps for that cluster; if a user hits that, the answer is to
-destroy with the original backend first, not to work around the guard.
+it down. Either backend refuses to build or tear down a cluster whose state
+under the *other* backend shows completed steps (or is unreadable); if a user
+hits that, the answer is to use the original backend, not to work around the
+guard. The footprints differ beyond names too: Terraform adds an `eso`
+identity, grants the deployer Key Vault Administrator rather than Crypto
+Officer, and does not support a private Key Vault, `skip_nodepool`, or fewer
+than 2 replicas — validation rejects those combinations.
+
+At the pinned module ref, Terraform builds in two stages with two `az` role
+assignments in between (steps tagged `d31-workaround`): the module omits VNet
+grants that the resource provider now requires. Do not remove those steps.
 
 Terraform phases are `workspace` → `init` → `plan` → `apply` → `outputs`. The
 first three write nothing to Azure, so `plan --backend terraform` runs a real
@@ -82,7 +90,8 @@ clone of that repo, prefix them with `uv run` instead. Check with
 
 3. **Plan.** `aro-hcp plan -c cluster.yaml -v`
    Show the user the phase breakdown and the pending write count. Nothing is
-   created. Resource IDs that do not exist yet render as `${SUBNET_ID}` — that
+   created. Quote versions in the config: YAML reads `4.20` as `4.2`, and
+   validation rejects it. Resource IDs that do not exist yet render as `${SUBNET_ID}` — that
    is expected on a greenfield run, not an error. On the terraform backend this
    clones the module, writes the tfvars and runs a genuine `terraform plan`;
    show the user its resource counts.
@@ -99,6 +108,13 @@ clone of that repo, prefix them with `uv run` instead. Check with
    role-assignments → etcd-encryption → cluster → nodepool.
 
 6. **Resume.** Apply is idempotent and writes state to `.aro-hcp/<cluster>.state.json`
+   after every step. Completed steps are re-checked against Azure, so a resource
+   deleted out of band is recreated. A cluster still `Provisioning` stops the
+   run with exit 5 ("re-run apply when the operation finishes") — wait and
+   re-run; do not treat it as done. Exit codes: 0 ok, 1 failed, 2 config/state,
+   3 declined, 4 preflight blocked, 5 incomplete.
+   The state file is bound to its cluster, subscription and settings; changing
+   the region, network or node pool after a partial build is refused.
    (`<cluster>.tf.state.json` on the terraform backend). After any failure, fix
    the cause and re-run the same command — completed steps are skipped.
    `aro-hcp status -c cluster.yaml` shows progress. Keep passing the
@@ -118,8 +134,12 @@ this deletes a cluster and a resource group and cannot be undone. Do not pass
 Tear down with the backend that built it — see the warning above.
 
 On `az-cli`, order is a dependency chain and must not be reordered: cluster →
-managed RG → Key Vault delete → Key Vault purge → identities → VNet → NSG →
-resource group.
+managed RG → Key Vault delete → Key Vault purge → identities → Key Vault private
+endpoint and DNS link/zone (if present) → VNet → NSG → resource group. The tool
+enforces it per step: `--phase` and `--keep-going` cannot run the vault,
+identity or network deletes while the cluster still exists. The confirmation
+lists resources in the group that aro-hcp did not create — read them out to the
+user; they will be deleted with the group.
 
 - **There is no node pool delete step, and adding one would break the
   teardown.** OCPBUGS-86702: the RP rejects `DELETE` of a cluster's last node
@@ -131,7 +151,8 @@ resource group.
 - Cluster deletion takes 15–30 minutes.
 - `skipped: already gone` is success, not a problem.
 - Teardown has its own state file, so it never interferes with a build run.
-  On success the build state file is removed.
+  On success both the build and the teardown state files are removed, so a
+  rebuilt cluster with the same name is torn down for real next time.
 
 On `terraform`, phases are `workspace` → `init` → `nodepool-state` → `destroy`.
 
@@ -158,6 +179,11 @@ On `terraform`, phases are `workspace` → `init` → `nodepool-state` → `dest
 | `no longer accepted` on a config key | `keyvault_name`, `kms_key_name`, `keyvault_private_endpoint` stopped being config keys when the terraform backend landed | The error names the replacement; delete the line |
 | `records N completed az-cli step(s)` on a terraform run | The az backend already built part of this cluster | Destroy with `--backend az-cli` first, or use a different `cluster_name`; do not try to force past it |
 | `terraform plan` errors about an undeclared variable | The pinned module ref moved, or `terraform_dir` points at a different version | Check `terraform_ref`; point `terraform_dir` at a matching checkout |
+| `MissingRequiredPermissions` for `dp-file-csi-driver` / `dp-image-registry` on a terraform build | The pinned module omits two VNet role grants (D31) | The `d31-workaround` steps add them; if they were disabled, re-enable `D31_ROLE_WORKAROUND`. If RBAC is still propagating, re-run apply |
+| `records cluster X, not Y` / `recorded with different settings` | The state file belongs to another cluster, subscription or config | Do not edit or delete it to get past this; use the matching config, or tear down first |
+| `another aro-hcp run is using ...` | A concurrent run holds the state lock | Wait for it; never run two applies against one cluster |
+| `blocked: needs cluster-delete first` | A teardown step's prerequisite (usually the cluster) still exists | Run the earlier phase; never force past it — the vault holds the live etcd key |
+| `exists but is still Provisioning` (exit 5) | A long-running create has not finished | Wait, then re-run apply |
 
 ## Scoped runs
 
@@ -172,6 +198,7 @@ On `terraform`, phases are `workspace` → `init` → `nodepool-state` → `dest
 
 `aro-hcp agent "..."` runs the same plan under Claude via the
 Anthropic SDK — for CI or unattended use outside this session. It needs
-`ANTHROPIC_API_KEY`. Inside Claude Code you are already the agent, so prefer the
+`ANTHROPIC_API_KEY`. `--apply` runs preflight and the same confirmation as
+`apply` first; `--destroy --apply` requires the typed cluster name (or `-y`). Inside Claude Code you are already the agent, so prefer the
 deterministic subcommands above; mention `agent` only if the user wants it to
 run outside the session.
