@@ -142,6 +142,12 @@ not passed through, and a module directory containing `*.auto.tfvars` or
 `terraform.tfvars` is refused, so nothing outside `cluster.yaml` can change what
 is applied. The checkout must be exactly the pinned commit and clean.
 
+**Tags enforced by Azure Policy.** Because every `plan` and `apply` runs a fresh
+`terraform plan`, tags that a subscription policy adds or inherits (`owner`,
+`cost-center`, …) show up as drift, and an apply would strip them on every run.
+List those tags under `tags:` in `cluster.yaml` so the configuration matches
+what the policy enforces; the plan is then clean.
+
 Teardown removes the node pools from Terraform state before destroying.
 OCPBUGS-86702: the resource provider rejects `DELETE` of a cluster's last node
 pool, which is the first thing `terraform destroy` tries, so a bare destroy
