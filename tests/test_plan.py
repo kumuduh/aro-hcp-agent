@@ -455,11 +455,16 @@ def test_present_resource_is_actually_deleted(tmp_path):
     executor.apply = True
     executor.persist = False
     calls: list[list[str]] = []
+    deleted: set[str] = set()
 
     def run(args, **kwargs):
         calls.append(list(args))
-        if "show" in args:
+        # The VNet is already gone (nsg-delete depends on it), and the NSG
+        # disappears once its delete has run (teardown verifies that).
+        if "show" in args and "nsg" in args and "nsg" not in deleted:
             return AzResult(["az"], 0, "/subscriptions/x/nsg", "")
+        if "delete" in args and "nsg" in args:
+            deleted.add("nsg")
         return AzResult(["az"], 0, "", "")
 
     executor.az.run = run

@@ -56,6 +56,23 @@ class Step:
     #: Name of an in-process action instead of a subprocess — see
     #: ``terraform.ACTIONS``. Set this and ``args`` is only for display.
     action: str | None = None
+    #: For a create whose probe returns a provisioning state: only these
+    #: values mean "done". Anything else non-empty is either in progress
+    #: (waited for) or terminal (a failure). Without this, a cluster in
+    #: ``Failed`` or ``Provisioning`` counted as already created.
+    ready_states: tuple[str, ...] = ()
+    #: Step ids whose resources must be in place (for a create) or gone (for
+    #: a delete) before this step may run. Checked against state, then against
+    #: Azure, so a phase-scoped run cannot skip ahead — e.g. purge the KMS
+    #: vault while the cluster that uses it still exists.
+    after: tuple[str, ...] = ()
+    #: Re-run on every invocation even when recorded complete. For cheap,
+    #: non-mutating steps whose output must be current (reads, terraform plan).
+    always: bool = False
+    #: Expected probe output for an existing resource. A resource that exists
+    #: with different settings (another prefix, no delegation) is a conflict,
+    #: not something to skip past.
+    expect: str | None = None
 
     def render(self, context: dict[str, str]) -> list[str]:
         return [Template(a).safe_substitute(context) for a in self.args]
@@ -73,7 +90,23 @@ def _rg() -> list[str]:
     return ["--resource-group", "${CUSTOMER_RG_NAME}"]
 
 
-def _identity_steps(prefix: str, suffix: str, phase: str) -> list[Step]:
+#: Provisioning states that mean a long-running create has not finished yet.
+IN_PROGRESS_STATES = ("Accepted", "Provisioning", "Updating", "Creating")
+
+
+def _tags(config: ClusterConfig) -> list[str]:
+    """``--tags`` for every create that supports it.
+
+    The terraform backend always rendered config tags; this backend silently
+    dropped them, so a cleanup policy keyed on tags could not find its
+    resources.
+    """
+    if not config.tags:
+        return []
+    return ["--tags", *(f"{key}={value}" for key, value in config.tags.items())]
+
+
+def _identity_steps(prefix: str, suffix: str, phase: str, tags: list[str] = ()) -> list[Step]:
     """Create one managed identity and capture the IDs the plan needs."""
     steps = [
         Step(
@@ -81,7 +114,7 @@ def _identity_steps(prefix: str, suffix: str, phase: str) -> list[Step]:
             phase=phase,
             description=f"Create managed identity {suffix}",
             args=["identity", "create", "--name", f"${{CLUSTER_NAME}}-{suffix}", *_rg(),
-                  "--location", "${LOCATION}"],
+                  "--location", "${LOCATION}", *tags],
             exists=["identity", "show", "--name", f"${{CLUSTER_NAME}}-{suffix}", *_rg(),
                     "--query", "id", "--output", "tsv"],
         ),
@@ -93,6 +126,7 @@ def _identity_steps(prefix: str, suffix: str, phase: str) -> list[Step]:
                   "--query", "id", "--output", "tsv"],
             capture=f"{prefix}_MI_ID",
             mutating=False,
+            always=True,
         ),
     ]
     if prefix in roles.PRINCIPAL_ID_NEEDED:
@@ -105,6 +139,7 @@ def _identity_steps(prefix: str, suffix: str, phase: str) -> list[Step]:
                       "--query", "principalId", "--output", "tsv"],
                 capture=f"{prefix}_MI_PID",
                 mutating=False,
+                always=True,
             )
         )
     return steps
@@ -139,6 +174,7 @@ def _role_assignment_step(
 def build_plan(config: ClusterConfig) -> list[Step]:
     """Return the full ordered provisioning plan for ``config``."""
     steps: list[Step] = []
+    tags = _tags(config)
 
     # -- resource providers -------------------------------------------------
     for provider in roles.REQUIRED_RESOURCE_PROVIDERS:
@@ -164,7 +200,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
             phase="resource-group",
             description="Create the customer resource group",
             args=["group", "create", "--name", "${CUSTOMER_RG_NAME}",
-                  "--location", "${LOCATION}"],
+                  "--location", "${LOCATION}", *tags],
             exists=["group", "show", "--name", "${CUSTOMER_RG_NAME}",
                     "--query", "id", "--output", "tsv"],
         )
@@ -177,7 +213,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
             phase="network",
             description="Create the network security group",
             args=["network", "nsg", "create", "--name", "${CUSTOMER_NSG}", *_rg(),
-                  "--location", "${LOCATION}"],
+                  "--location", "${LOCATION}", *tags],
             exists=["network", "nsg", "show", "--name", "${CUSTOMER_NSG}", *_rg(),
                     "--query", "id", "--output", "tsv"],
         ),
@@ -190,9 +226,10 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                   "--address-prefixes", config.vnet_address_prefix,
                   "--subnet-name", "${CUSTOMER_VNET_SUBNET1}",
                   "--subnet-prefixes", config.worker_subnet_prefix,
-                  "--nsg", "${CUSTOMER_NSG}"],
+                  "--nsg", "${CUSTOMER_NSG}", *tags],
             exists=["network", "vnet", "show", "--name", "${CUSTOMER_VNET_NAME}", *_rg(),
-                    "--query", "id", "--output", "tsv"],
+                    "--query", "addressSpace.addressPrefixes[0]", "--output", "tsv"],
+            expect=config.vnet_address_prefix,
         ),
         Step(
             id="vnet-integration-subnet",
@@ -206,7 +243,9 @@ def build_plan(config: ClusterConfig) -> list[Step]:
             exists=["network", "vnet", "subnet", "show",
                     "--name", "${CUSTOMER_VNET_INTEGRATION_SUBNET_NAME}",
                     "--vnet-name", "${CUSTOMER_VNET_NAME}", *_rg(),
-                    "--query", "id", "--output", "tsv"],
+                    "--query", "join(' ', [addressPrefix || addressPrefixes[0], delegations[0].serviceName || 'none'])",
+                    "--output", "tsv"],
+            expect=f"{config.vnet_integration_subnet_prefix} {roles.VNET_INTEGRATION_DELEGATION}",
         ),
         Step(
             id="nsg-id",
@@ -216,6 +255,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                   "--query", "id", "--output", "tsv"],
             capture="NSG_ID",
             mutating=False,
+            always=True,
         ),
         Step(
             id="vnet-id",
@@ -225,6 +265,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                   "--query", "id", "--output", "tsv"],
             capture="VNET_ID",
             mutating=False,
+            always=True,
         ),
         Step(
             id="worker-subnet-id",
@@ -235,6 +276,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                   "--query", "id", "--output", "tsv"],
             capture="SUBNET_ID",
             mutating=False,
+            always=True,
         ),
         Step(
             id="integration-subnet-id",
@@ -246,18 +288,19 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                   "--query", "id", "--output", "tsv"],
             capture="VNET_INTEGRATION_SUBNET_ID",
             mutating=False,
+            always=True,
         ),
     ]
 
     # -- managed identities -------------------------------------------------
     for _key, suffix, prefix in roles.CONTROL_PLANE_IDENTITIES:
-        steps += _identity_steps(prefix, suffix, "identities")
+        steps += _identity_steps(prefix, suffix, "identities", tags)
     for _key, suffix, prefix in roles.DATA_PLANE_IDENTITIES:
-        steps += _identity_steps(prefix, suffix, "identities")
+        steps += _identity_steps(prefix, suffix, "identities", tags)
     service_suffix, service_prefix = roles.SERVICE_IDENTITY
-    steps += _identity_steps(service_prefix, service_suffix, "identities")
+    steps += _identity_steps(service_prefix, service_suffix, "identities", tags)
     kms_suffix, kms_prefix = roles.KMS_IDENTITY
-    steps += _identity_steps(kms_prefix, kms_suffix, "identities")
+    steps += _identity_steps(kms_prefix, kms_suffix, "identities", tags)
 
     # -- role assignments ---------------------------------------------------
     assignments = (
@@ -278,10 +321,12 @@ def build_plan(config: ClusterConfig) -> list[Step]:
             phase="etcd-encryption",
             description="Create the Key Vault (RBAC authorization)",
             args=["keyvault", "create", "--name", "${KEYVAULT_NAME}", *_rg(),
-                  "--location", "${LOCATION}", "--enable-rbac-authorization", "true"],
+                  "--location", "${LOCATION}", "--enable-rbac-authorization", "true", *tags],
             exists=["keyvault", "show", "--name", "${KEYVAULT_NAME}", *_rg(),
                     "--query", "id", "--output", "tsv"],
             timeout=600,
+            # Billed per operation; listed so the confirmation summary names it.
+            tags=("billable",),
         ),
         Step(
             id="keyvault-id",
@@ -291,6 +336,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                   "--query", "id", "--output", "tsv"],
             capture="KEYVAULT_ID",
             mutating=False,
+            always=True,
         ),
         Step(
             id="keyvault-crypto-officer",
@@ -322,6 +368,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
             capture="KMS_KEY_VERSION",
             capture_transform="basename",
             mutating=False,
+            always=True,
         ),
         _role_assignment_step(
             99, "KMS_MI_PID", roles.KEY_VAULT_CRYPTO_USER_ROLE, "KEYVAULT_ID",
@@ -347,20 +394,22 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                       "--vnet-name", "${CUSTOMER_VNET_NAME}",
                       "--subnet", "${CUSTOMER_VNET_SUBNET1}",
                       "--private-connection-resource-id", "${KEYVAULT_ID}",
-                      "--group-ids", "vault", "--connection-name", "kv-private-endpoint"],
+                      "--group-ids", "vault", "--connection-name", "kv-private-endpoint", *tags],
                 exists=["network", "private-endpoint", "show", "--name", "kv-private-endpoint",
                         *_rg(), "--query", "id", "--output", "tsv"],
                 requires=("KEYVAULT_ID",),
+                tags=("billable",),
             ),
             Step(
                 id="keyvault-dns-zone",
                 phase="etcd-encryption",
                 description="Create the Key Vault private DNS zone",
                 args=["network", "private-dns", "zone", "create",
-                      "--name", roles.KEYVAULT_PRIVATE_DNS_ZONE, *_rg()],
+                      "--name", roles.KEYVAULT_PRIVATE_DNS_ZONE, *_rg(), *tags],
                 exists=["network", "private-dns", "zone", "show",
                         "--name", roles.KEYVAULT_PRIVATE_DNS_ZONE, *_rg(),
                         "--query", "id", "--output", "tsv"],
+                tags=("billable",),
             ),
             Step(
                 id="keyvault-dns-link",
@@ -409,6 +458,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
         "--api-visibility", config.api_visibility,
         "--ingress-visibility", config.ingress_visibility,
         "--assign-service-managed-identity", "${SERVICE_MI_ID}",
+        *tags,
     ]
     cluster_requires = [
         "SUBNET_ID", "VNET_INTEGRATION_SUBNET_ID", "NSG_ID",
@@ -434,6 +484,7 @@ def build_plan(config: ClusterConfig) -> list[Step]:
             requires=tuple(cluster_requires),
             timeout=LONG_TIMEOUT,
             tags=("billable", "long-running"),
+            ready_states=("Succeeded",),
         )
     )
     steps.append(
@@ -467,12 +518,17 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                       "--replicas", str(config.nodepool_replicas),
                       "--vm-size", config.nodepool_vm_size,
                       "--version", "${NP_VERSION}",
-                      "--channel-group", config.channel_group],
+                      "--channel-group", config.channel_group, *tags],
                 exists=["aro", "hcp", "cluster", "nodepool", "show",
                         "--cluster-name", "${CLUSTER_NAME}", "--name", "${NP_NAME}", *_rg(),
                         "--query", "properties.provisioningState", "--output", "tsv"],
                 timeout=LONG_TIMEOUT,
                 tags=("billable", "long-running"),
+                ready_states=("Succeeded",),
+                # The RP rejects a node pool while its cluster is still
+                # provisioning (Conflict), and the create step itself carries
+                # no resource-ID dependency on the cluster to stop it.
+                after=("cluster-create",),
             ),
             Step(
                 id="nodepool-state",

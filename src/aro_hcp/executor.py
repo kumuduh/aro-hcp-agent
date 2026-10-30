@@ -8,13 +8,15 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from . import state as state_mod
-from .azure import AzCli, AzError, AzResult
+from .azure import AzCli, AzError, AzResult  # noqa: F401  (AzError re-exported)
 from .config import ClusterConfig
-from .plan import Step
+from .plan import IN_PROGRESS_STATES, Step
 from .state import RunState
 
 #: Substrings that mean "the write already happened" rather than a real failure.
-#: Kept deliberately narrow — a broad match here would swallow real errors.
+#: A match is only trusted once the step's own probe confirms the resource now
+#: exists: "already exists" alone also describes a *different* resource that
+#: blocks this one (a taken Key Vault name, a stale managed resource group).
 _BENIGN = (
     "RoleAssignmentExists",
     "The role assignment already exists",
@@ -22,21 +24,27 @@ _BENIGN = (
     "AlreadyExists",
 )
 
-#: The same idea for teardown: the resource is gone, which is the goal.
-_BENIGN_DELETE = (
+#: Benign without a probe: a role assignment conflict can only be about the
+#: assignment being created.
+_BENIGN_UNPROBED = ("RoleAssignmentExists", "The role assignment already exists")
+
+#: Substrings that mean a resource is not there. Used to read both a failed
+#: delete and a failed existence probe; anything else is "unknown".
+_NOT_FOUND = (
     "ResourceNotFound",
     "ResourceGroupNotFound",
     "ParentResourceNotFound",
+    "DeletedVaultNotFound",
+    "VaultNotFound",
+    "KeyNotFound",
     "could not be found",
     "was not found",
     "does not exist",
+    "NotFound",
 )
 
-#: Substrings that mean "Azure has not finished propagating a role assignment".
-#: A role assignment is visible to the control plane immediately, but the Key
-#: Vault data plane and Azure AD lag it by seconds to minutes — so the very
-#: next step, which uses the permission just granted, can be refused. Retrying
-#: the identical command is the documented remedy.
+#: Substrings that mean "Azure has not finished propagating a role assignment",
+#: or is throttling. Retrying the identical command is the documented remedy.
 #:
 #: A bare "AuthorizationFailed" is deliberately absent: that is the ordinary
 #: "you do not hold this role" error, and retrying it just delays the report.
@@ -45,12 +53,30 @@ _TRANSIENT = (
     "ForbiddenByRbac",
     "PrincipalNotFound",
     "does not exist in the directory",
+    "TooManyRequests",
+    "RetryableError",
 )
 
 #: Backoff between retries of a step failing for propagation. Key Vault RBAC
 #: is documented as taking up to ~10 minutes in the worst case; this waits
 #: just under four, which covers it in practice without stalling a bad run.
 RETRY_DELAYS = (15, 30, 60, 120)
+
+#: Seconds between probes while waiting for a long-running operation.
+POLL_INTERVAL = 30
+
+PRESENT = "present"
+ABSENT = "absent"
+UNKNOWN = "unknown"
+
+
+class StepBlocked(Exception):
+    """A step's prerequisites are not in place, so running it would be unsafe."""
+
+    def __init__(self, step_id: str, reason: str) -> None:
+        super().__init__(f"{step_id}: {reason}")
+        self.step_id = step_id
+        self.reason = reason
 
 
 @dataclass
@@ -81,6 +107,8 @@ class Executor:
         retry_delays: tuple[int, ...] = RETRY_DELAYS,
         sleep: Callable[[float], None] = time.sleep,
         runners: dict[str, object] | None = None,
+        poll_interval: float = POLL_INTERVAL,
+        fingerprint: dict[str, str] | None = None,
     ) -> None:
         self.config = config
         self.plan = plan
@@ -95,12 +123,14 @@ class Executor:
         self.on_event = on_event or (lambda _msg: None)
         self.retry_delays = retry_delays
         self.sleep = sleep
+        self.poll_interval = poll_interval
         self._confirmed_phases: set[str] = set()
+        #: Set when the operator declines a phase; the rest of the run stops.
+        self.declined = False
         #: A dry run must not leave a state file claiming work was done.
         self.persist = apply
 
-        self.state.cluster_name = config.cluster_name
-        self.state.subscription_id = config.subscription_id or ""
+        self.state.bind(config.cluster_name, config.subscription_id or "", fingerprint or {})
         for key, value in config.base_context().items():
             self.state.set_context(key, value)
 
@@ -113,8 +143,12 @@ class Executor:
     def steps_by_id(self) -> dict[str, Step]:
         return {step.id: step for step in self.plan}
 
-    def pending(self) -> list[Step]:
-        return [s for s in self.plan if not self.state.is_complete(s.id)]
+    def pending(self, phases: Iterable[str] | None = None) -> list[Step]:
+        wanted = set(phases) if phases else None
+        return [
+            s for s in self.plan
+            if (wanted is None or s.phase in wanted) and not self.state.is_complete(s.id)
+        ]
 
     # -- rendering ----------------------------------------------------------
 
@@ -129,7 +163,7 @@ class Executor:
 
     def render(self, step: Step) -> str:
         argv = step.render(self.context)
-        if step.action is None:
+        if step.action is None and step.runner in self.runners:
             argv = self.runner_for(step).build(argv)
         return " ".join(shlex.quote(a) for a in argv)
 
@@ -145,12 +179,45 @@ class Executor:
 
     # -- execution ----------------------------------------------------------
 
+    def _reverify(self, step: Step) -> bool:
+        """True if a completed step should be re-checked against Azure."""
+        return self.apply and step.exists is not None and step.mutating
+
     def run_step(self, step: Step, *, force: bool = False) -> StepOutcome:
-        if self.state.is_complete(step.id) and not force:
-            return StepOutcome(
-                step, self.state.status(step.id), self.render(step),
-                message="already recorded complete in state",
-            )
+        """Run one step. Raises StepBlocked (apply mode) if its prerequisites are missing."""
+        if step.runner not in self.runners:
+            message = (f"step {step.id} wants the {step.runner!r} runner, which this "
+                       f"executor was not given (have: {', '.join(sorted(self.runners))})")
+            self._record(step.id, state_mod.FAILED, detail=message)
+            return StepOutcome(step, state_mod.FAILED, self.render(step), message=message)
+
+        command = self.render(step)
+
+        if self.state.is_complete(step.id) and not force and not step.always:
+            recorded = self.state.status(step.id)
+            # Outside apply, a recorded result is all a report needs. During an
+            # apply, a recorded delete or create is re-checked against Azure:
+            # a teardown state left over from an earlier lifecycle must not
+            # make a later teardown skip a cluster that exists again, and a
+            # resource removed out of band must be recreated, not assumed.
+            if not self._reverify(step):
+                return StepOutcome(
+                    step, recorded, command, message="already recorded complete in state",
+                )
+            found, text, err = self._probe(step)
+            if found == UNKNOWN:
+                message = f"recorded complete, but could not verify against Azure: {err}"
+                self._record(step.id, state_mod.FAILED, command=command, detail=message)
+                return StepOutcome(step, state_mod.FAILED, command, message=message)
+            if (found == ABSENT) is step.deletes and self._ready(step, text) is not False:
+                self._capture(step, AzResult([], 0, text, ""))
+                return StepOutcome(step, state_mod.SKIPPED, command, stdout=text,
+                                   message="verified against Azure")
+            note = "exists again" if step.deletes else "is missing from Azure or not ready"
+            self.on_event(f"redo  {step.id}: recorded complete but the resource {note}")
+            self.state.reset(step.id)
+
+        self._check_after(step)
 
         missing = step.unresolved(self.context)
         if missing:
@@ -160,31 +227,30 @@ class Executor:
             )
             if not self.apply:
                 # Expected during a dry run of a greenfield deployment.
-                return StepOutcome(step, state_mod.PENDING, self.render(step), message=message)
+                return StepOutcome(step, state_mod.PENDING, command, message=message)
             self._record(step.id, state_mod.FAILED, detail=message)
-            return StepOutcome(step, state_mod.FAILED, self.render(step), message=message)
-
-        command = self.render(step)
+            return StepOutcome(step, state_mod.FAILED, command, message=message)
 
         # Idempotency: for a create, a lookup that returns something means the
         # resource is there and the create is a no-op. For a delete the sense
         # is inverted — nothing to look up means the teardown already happened.
+        # A lookup that fails for any reason other than "not found" proves
+        # nothing either way, and is never read as absence.
         if step.exists is not None:
-            probe = self.runner_for(step).run(
-                step.render_exists(self.context), check=False, force=True
-            )
-            present = bool(probe.ok and probe.text)
-            if present is not step.deletes:
-                note = "already gone" if step.deletes else "already present"
-                self._record(
-                    step.id, state_mod.SKIPPED, command=command,
-                    detail=f"{note}: {probe.text}" if probe.text else note,
-                )
-                self._capture(step, probe)
-                self.on_event(f"skip  {step.id}: {note}")
-                return StepOutcome(
-                    step, state_mod.SKIPPED, command, stdout=probe.text, message=note,
-                )
+            found, text, err = self._probe(step)
+            if found == UNKNOWN:
+                message = f"could not tell whether the resource exists: {err}"
+                if not self.apply:
+                    return StepOutcome(step, state_mod.PENDING, command, message=message)
+                self._record(step.id, state_mod.FAILED, command=command, detail=message)
+                self.on_event(f"FAIL  {step.id}: {message.splitlines()[0]}")
+                return StepOutcome(step, state_mod.FAILED, command, stderr=err, message=message)
+            if step.deletes and found == ABSENT:
+                self._record(step.id, state_mod.SKIPPED, command=command, detail="already gone")
+                self.on_event(f"skip  {step.id}: already gone")
+                return StepOutcome(step, state_mod.SKIPPED, command, message="already gone")
+            if not step.deletes and found == PRESENT:
+                return self._existing(step, command, text)
 
         if step.mutating and not self.apply:
             self.on_event(f"plan  {step.id}: {command}")
@@ -201,27 +267,20 @@ class Executor:
         self.on_event(f"run   {step.id}: {step.description}")
         result = self._run_with_retries(step)
 
-        if not result.ok and self._is_benign(result, deletes=step.deletes):
-            self._record(
-                step.id, state_mod.SKIPPED, command=command, detail=result.stderr.strip()
-            )
-            return StepOutcome(
-                step, state_mod.SKIPPED, command, stderr=result.stderr,
-                message="already gone" if step.deletes else "already exists",
-            )
-
         if not result.ok:
-            detail = result.stderr.strip() or result.stdout.strip()
-            # In a dry run the only commands that reach here are lookups, and
-            # they fail simply because nothing has been created yet.
-            status = state_mod.FAILED if self.apply else state_mod.PENDING
-            self._record(step.id, status, command=command, detail=detail)
-            if status == state_mod.FAILED:
-                self.on_event(f"FAIL  {step.id}: {detail.splitlines()[0] if detail else '?'}")
-            return StepOutcome(
-                step, status, command, stdout=result.stdout,
-                stderr=result.stderr, message=detail,
-            )
+            return self._failed(step, command, result)
+
+        if step.capture and not result.text and self.apply:
+            # Recording this as done would leave the variable unset and every
+            # later run failing "unresolved" with nothing left to re-run.
+            message = f"{step.id} succeeded but returned no value for {step.capture}"
+            self._record(step.id, state_mod.FAILED, command=command, detail=message)
+            return StepOutcome(step, state_mod.FAILED, command, message=message)
+
+        if self._reverify(step):
+            settled = self._settle(step, command)
+            if settled is not None:
+                return settled
 
         self._capture(step, result)
         self._record(step.id, state_mod.DONE, command=command, detail=result.text[:200])
@@ -230,10 +289,23 @@ class Executor:
     def run_phase(self, phase: str, *, stop_on_error: bool = True) -> list[StepOutcome]:
         outcomes = []
         for step in self.plan:
-            if step.phase != phase or self.state.is_complete(step.id):
+            if step.phase != phase:
                 continue
-            outcome = self.run_step(step)
+            # Outside apply, completed steps are left alone; during an apply
+            # run_step re-verifies them against Azure.
+            if (self.state.is_complete(step.id) and not step.always
+                    and not self._reverify(step)):
+                continue
+            try:
+                outcome = self.run_step(step)
+            except StepBlocked as exc:
+                self._record(step.id, state_mod.FAILED, detail=exc.reason)
+                self.on_event(f"FAIL  {step.id}: blocked — {exc.reason}")
+                outcome = StepOutcome(step, state_mod.FAILED, self.render(step),
+                                      message=f"blocked: {exc.reason}")
             outcomes.append(outcome)
+            if self.declined:
+                break
             if outcome.status == state_mod.FAILED and stop_on_error:
                 break
         if self.persist:
@@ -254,11 +326,167 @@ class Executor:
         for phase in seen:
             phase_outcomes = self.run_phase(phase, stop_on_error=stop_on_error)
             outcomes += phase_outcomes
+            if self.declined:
+                break
             if stop_on_error and any(o.status == state_mod.FAILED for o in phase_outcomes):
                 break
         return outcomes
 
     # -- helpers ------------------------------------------------------------
+
+    def _probe(self, step: Step) -> tuple[str, str, str]:
+        """Return (PRESENT|ABSENT|UNKNOWN, stdout, error) for the step's resource."""
+        probe = self.runner_for(step).run(
+            step.render_exists(self.context), check=False, force=True
+        )
+        if probe.ok:
+            return (PRESENT if probe.text else ABSENT), probe.text, ""
+        err = probe.stderr.strip() or probe.stdout.strip() or f"exit {probe.returncode}"
+        if self._is_transient(probe) or probe.returncode == 124:
+            return UNKNOWN, "", err
+        if self._matches(probe, _NOT_FOUND):
+            return ABSENT, "", err
+        return UNKNOWN, "", err
+
+    @staticmethod
+    def _ready(step: Step, text: str) -> bool | None:
+        """True if a create's probe output means done, False if not, None if N/A."""
+        if not step.ready_states or step.deletes:
+            return None
+        return text in step.ready_states
+
+    def _existing(self, step: Step, command: str, text: str) -> StepOutcome:
+        """The create's resource already exists: decide whether that is done."""
+        if step.ready_states:
+            if text in IN_PROGRESS_STATES:
+                if not self.apply:
+                    return StepOutcome(step, state_mod.PENDING, command,
+                                       message=f"exists, still {text}")
+                text = self._wait_while_in_progress(step, text)
+            if text not in step.ready_states:
+                message = (
+                    f"the resource already exists in state {text!r}, which is not "
+                    f"{' / '.join(step.ready_states)}. "
+                    + ("It is still in progress; re-run when it finishes."
+                       if text in IN_PROGRESS_STATES else
+                       "Delete it (aro-hcp destroy, or az) and re-run apply.")
+                )
+                if not self.apply:
+                    return StepOutcome(step, state_mod.PENDING, command, message=message)
+                self._record(step.id, state_mod.FAILED, command=command, detail=message)
+                self.on_event(f"FAIL  {step.id}: exists in state {text}")
+                return StepOutcome(step, state_mod.FAILED, command, stdout=text, message=message)
+        elif step.expect is not None and text != step.expect:
+            message = (
+                f"the resource already exists with different settings: found {text!r}, "
+                f"the config wants {step.expect!r}. Remove it or change the config"
+            )
+            if self.apply:
+                self._record(step.id, state_mod.FAILED, command=command, detail=message)
+                return StepOutcome(step, state_mod.FAILED, command, stdout=text, message=message)
+            return StepOutcome(step, state_mod.PENDING, command, message=message)
+        self._record(step.id, state_mod.SKIPPED, command=command, detail=f"already present: {text}")
+        self._capture(step, AzResult([], 0, text, ""))
+        self.on_event(f"skip  {step.id}: already present")
+        return StepOutcome(step, state_mod.SKIPPED, command, stdout=text, message="already present")
+
+    def _wait_while_in_progress(self, step: Step, text: str) -> str:
+        """Poll a create's probe until it leaves the in-progress states or times out."""
+        waited = 0.0
+        while text in IN_PROGRESS_STATES and waited < step.timeout:
+            self.on_event(f"wait  {step.id}: still {text}; checking again in {self.poll_interval:.0f}s")
+            self.sleep(self.poll_interval)
+            waited += self.poll_interval
+            found, text, _err = self._probe(step)
+            if found != PRESENT:
+                return text or found
+        return text
+
+    def _settle(self, step: Step, command: str) -> StepOutcome | None:
+        """After a successful command, confirm Azure agrees. None means it does."""
+        if step.deletes:
+            # A delete that returned 0 is not proof the resource is gone; some
+            # deletes return before the resource disappears.
+            waited = 0.0
+            while True:
+                found, _text, err = self._probe(step)
+                if found == ABSENT:
+                    return None
+                if waited >= step.timeout:
+                    message = ("delete returned success but the resource is still "
+                               + ("present" if found == PRESENT else f"unverifiable: {err}"))
+                    self._record(step.id, state_mod.FAILED, command=command, detail=message)
+                    return StepOutcome(step, state_mod.FAILED, command, message=message)
+                self.sleep(self.poll_interval)
+                waited += self.poll_interval
+        if step.ready_states:
+            found, text, err = self._probe(step)
+            if found == PRESENT and text in IN_PROGRESS_STATES:
+                text = self._wait_while_in_progress(step, text)
+            if text not in step.ready_states:
+                message = (f"create returned but the resource is in state {text or found!r}"
+                           + (f": {err}" if err else ""))
+                self._record(step.id, state_mod.FAILED, command=command, detail=message)
+                self.on_event(f"FAIL  {step.id}: {message}")
+                return StepOutcome(step, state_mod.FAILED, command, message=message)
+        return None
+
+    def _failed(self, step: Step, command: str, result: AzResult) -> StepOutcome:
+        detail = result.stderr.strip() or result.stdout.strip()
+        # A retry budget exhausted on propagation lag is still a failure, even
+        # when its text also contains a "not found" phrase.
+        if not self._is_transient(result):
+            if step.deletes and self._matches(result, _NOT_FOUND):
+                self._record(step.id, state_mod.SKIPPED, command=command, detail=detail)
+                return StepOutcome(step, state_mod.SKIPPED, command, stderr=result.stderr,
+                                   message="already gone")
+            if not step.deletes and self._matches(result, _BENIGN):
+                if step.exists is not None:
+                    found, text, _err = self._probe(step)
+                    confirmed = found == PRESENT and self._ready(step, text) is not False
+                    if confirmed:
+                        self._capture(step, AzResult([], 0, text, ""))
+                else:
+                    confirmed = self._matches(result, _BENIGN_UNPROBED)
+                if confirmed:
+                    self._record(step.id, state_mod.SKIPPED, command=command, detail=detail)
+                    return StepOutcome(step, state_mod.SKIPPED, command,
+                                       stderr=result.stderr, message="already exists")
+
+        # In a dry run the only commands that reach here are lookups, and
+        # they fail simply because nothing has been created yet.
+        status = state_mod.FAILED if self.apply else state_mod.PENDING
+        self._record(step.id, status, command=command, detail=detail)
+        if status == state_mod.FAILED:
+            self.on_event(f"FAIL  {step.id}: {detail.splitlines()[0] if detail else '?'}")
+        return StepOutcome(
+            step, status, command, stdout=result.stdout, stderr=result.stderr, message=detail,
+        )
+
+    def _check_after(self, step: Step) -> None:
+        """Refuse to run a step whose prerequisite resources are not in place."""
+        if not step.after:
+            return
+        by_id = self.steps_by_id()
+        for dep_id in step.after:
+            dep = by_id.get(dep_id)
+            if dep is None or self.state.is_complete(dep_id):
+                continue
+            satisfied = False
+            if dep.exists is not None:
+                found, text, _err = self._probe(dep)
+                if dep.deletes:
+                    satisfied = found == ABSENT
+                else:
+                    satisfied = found == PRESENT and self._ready(dep, text) is not False
+            if not satisfied:
+                verb = "gone" if dep.deletes else "in place"
+                reason = (f"needs {dep_id} first ({dep.description}); its resource is not "
+                          f"confirmed {verb}")
+                if self.apply:
+                    raise StepBlocked(step.id, reason)
+                self.on_event(f"plan  {step.id}: waits for {dep_id}")
+                return
 
     def _run_with_retries(self, step: Step) -> AzResult:
         """Run a step, repeating it while Azure reports propagation lag.
@@ -302,6 +530,9 @@ class Executor:
     def _record(self, step_id: str, status: str, *, command: str = "", detail: str = "") -> None:
         if self.persist:
             self.state.record(step_id, status, command=command, detail=detail)
+            # Saved per step, not per phase: an interrupted run must not lose
+            # the record of resources it already created.
+            self.state.save()
 
     def _capture(self, step: Step, result: AzResult) -> None:
         if not (step.capture and result.text):
@@ -312,24 +543,31 @@ class Executor:
         self.state.set_context(step.capture, value)
 
     @staticmethod
-    def _is_benign(result: AzResult, *, deletes: bool = False) -> bool:
+    def _matches(result: AzResult, markers: tuple[str, ...]) -> bool:
         blob = f"{result.stderr}\n{result.stdout}".lower()
-        markers = _BENIGN_DELETE if deletes else _BENIGN
         return any(marker.lower() in blob for marker in markers)
 
-    @staticmethod
-    def _is_transient(result: AzResult) -> bool:
-        blob = f"{result.stderr}\n{result.stdout}"
-        return any(marker.lower() in blob.lower() for marker in _TRANSIENT)
+    @classmethod
+    def _is_benign(cls, result: AzResult, *, deletes: bool = False) -> bool:
+        return cls._matches(result, _NOT_FOUND if deletes else _BENIGN)
+
+    @classmethod
+    def _is_transient(cls, result: AzResult) -> bool:
+        return cls._matches(result, _TRANSIENT)
 
     def _ensure_confirmed(self, step: Step) -> bool:
         if self.confirm is None or step.phase in self._confirmed_phases:
             return True
+        if self.declined:
+            return False
         remaining = [
             s for s in self.plan
             if s.phase == step.phase and s.mutating and not self.state.is_complete(s.id)
         ]
         if not self.confirm(step.phase, remaining):
+            # Later phases consume this one's resources, so a decline ends the
+            # run rather than moving on and prompting again.
+            self.declined = True
             return False
         self._confirmed_phases.add(step.phase)
         return True

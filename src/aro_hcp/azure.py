@@ -21,6 +21,15 @@ class AzNotFound(RuntimeError):
     """The `az` CLI is not on PATH."""
 
 
+def _text(value) -> str:
+    """Partial output from a timed-out process may be bytes even with text=True."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 @dataclass
 class AzResult:
     args: list[str]
@@ -128,7 +137,16 @@ class AzCli:
                 argv, capture_output=True, text=True, timeout=timeout, check=False
             )
         except subprocess.TimeoutExpired as exc:
-            result = AzResult(argv, 124, exc.stdout or "", f"timed out after {timeout}s")
+            result = AzResult(argv, 124, _text(exc.stdout), f"timed out after {timeout}s")
+            self._log.append(result)
+            if check:
+                raise AzError(result) from exc
+            return result
+        except OSError as exc:
+            # az vanished or lost its execute bit mid-run. Report it like any
+            # other failed command so the executor records the step and the
+            # phase's progress is saved, rather than escaping as a traceback.
+            result = AzResult(argv, 127, "", f"could not start az: {exc}")
             self._log.append(result)
             if check:
                 raise AzError(result) from exc
