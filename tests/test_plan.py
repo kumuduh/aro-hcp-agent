@@ -570,7 +570,7 @@ def no_az(monkeypatch):
 
 @pytest.mark.parametrize("args", [
     "group show --name demo-rg",
-    "network vnet subnet show --name worker-subnet --vnet-name v -g rg",
+    "network vnet subnet show --name worker-subnet --vnet-name v -g demo-rg",
     "vm list-usage --location eastus2",
     "aro hcp get-versions --location eastus2 --control-plane",
 ])

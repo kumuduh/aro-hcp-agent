@@ -324,8 +324,8 @@ confirmation for a build, the typed cluster name for `--destroy --apply`
 executor's dependency checks apply to the agent's tools too — it cannot purge
 the vault while the cluster exists. `inspect_azure` runs only an allowlist of
 read commands, refuses anything that can return secrets (Key Vault secrets,
-storage keys, credentials, tokens), `@file` arguments, `--debug`, and other
-subscriptions, and redacts secret-looking values in what it returns. The exit
+storage keys, credentials, tokens), `@file` arguments, `--debug`, and any
+subscription or resource group other than this cluster's, and redacts secret-looking values in what it returns. The exit
 code reflects the plan, not the model's last message: failed or pending steps,
 a refusal, or hitting `--max-turns` exit non-zero.
 

@@ -87,7 +87,15 @@ def _load_config(args: argparse.Namespace) -> ClusterConfig:
 
 
 def _fingerprint(config: ClusterConfig, *, destroy: bool) -> dict[str, str]:
-    keys = ("location", "resource_group", "backend") if destroy else _FINGERPRINT_KEYS
+    # Terraform reconciles a changed setting itself (a fresh plan runs every
+    # time), so only the target's identity is pinned there; the az-cli
+    # backend has no update path and pins everything a completed step used.
+    if destroy:
+        keys = ("location", "resource_group", "backend")
+    elif config.backend == "terraform":
+        keys = ("location", "resource_group", "managed_resource_group", "backend")
+    else:
+        keys = _FINGERPRINT_KEYS
     return {key: str(getattr(config, key)) for key in keys}
 
 
@@ -105,7 +113,9 @@ def _completed_steps(path: Path) -> int | None:
     )
 
 
-def _guard_mixed_backends(config: ClusterConfig, state_dir, *, apply: bool, destroy: bool) -> None:
+def _guard_mixed_backends(
+    config: ClusterConfig, state_dir, *, apply: bool, destroy: bool, custom_state: str | None = None,
+) -> None:
     """Refuse to let one backend act on a cluster the other one built.
 
     The two backends name the Key Vault and the managed identities
@@ -117,8 +127,19 @@ def _guard_mixed_backends(config: ClusterConfig, state_dir, *, apply: bool, dest
     """
     terraform = config.backend == "terraform"
     other_backend = "az-cli" if terraform else "terraform"
-    other = default_state_path(config.cluster_name, state_dir, suffix=None if terraform else "tf")
-    done = _completed_steps(other)
+    suffix = None if terraform else "tf"
+    # The default location, and the directory of a custom --state: a run
+    # that used --state must not slip past the guard.
+    candidates = [default_state_path(config.cluster_name, state_dir, suffix=suffix)]
+    if custom_state:
+        candidates.append(default_state_path(config.cluster_name, Path(custom_state).parent,
+                                             suffix=suffix))
+    other, done = candidates[0], 0
+    for path in candidates:
+        found = _completed_steps(path)
+        if found != 0:
+            other, done = path, found
+            break
     if done == 0:
         return
     what = "an unreadable state file" if done is None else f"{done} completed {other_backend} step(s)"
@@ -189,7 +210,8 @@ def _setup(
         _check_writable(state_path)
     run_state = RunState.load(state_path)
 
-    _guard_mixed_backends(config, args.state_dir, apply=apply, destroy=destroy)
+    _guard_mixed_backends(config, args.state_dir, apply=apply, destroy=destroy,
+                          custom_state=args.state)
 
     runners = None
     if terraform:
@@ -213,7 +235,11 @@ def _setup(
         config, plan, az, run_state,
         apply=apply,
         confirm=confirm,
-        on_event=(lambda msg: print(msg, flush=True)) if not args.quiet else None,
+        # Progress goes to stderr when stdout carries JSON.
+        on_event=None if args.quiet else (
+            (lambda msg: print(msg, file=sys.stderr, flush=True)) if getattr(args, "json", False)
+            else (lambda msg: print(msg, flush=True))
+        ),
         runners=runners,
         fingerprint=_fingerprint(config, destroy=destroy),
     )
@@ -282,16 +308,8 @@ def _confirm_apply(executor: Executor, phases) -> bool:
     return input("Proceed? [y/N] ").strip().lower() in ("y", "yes")
 
 
-def _confirm_destroy(config: ClusterConfig, executor: Executor) -> bool:
-    """Make the operator type the cluster name before anything is deleted.
-
-    Teardown is irreversible and the resource names are the only thing
-    standing between this and the wrong cluster. A y/N is too easy to
-    answer on autopilot.
-    """
-    if not sys.stdin.isatty():
-        _eprint("\nstdin is not a TTY and --yes was not given; declining to delete.")
-        return False
+def _destroy_summary(config: ClusterConfig, executor: Executor) -> None:
+    """What a teardown deletes. Printed with or without the prompt (-y)."""
     if config.backend == "terraform":
         scope = "everything Terraform owns, including its Key Vault (purged)"
     else:
@@ -302,7 +320,21 @@ def _confirm_destroy(config: ClusterConfig, executor: Executor) -> bool:
           f"and resource group {config.resource_group} with anything else in it, in "
           f"subscription {config.subscription_id}.")
     _warn_foreign_resources(config, executor)
-    typed = input(f"Type the cluster name ({config.cluster_name}) to confirm: ").strip()
+
+
+def _confirm_destroy(config: ClusterConfig, executor: Executor) -> bool:
+    """Make the operator type the cluster name before anything is deleted.
+
+    Teardown is irreversible and the resource names are the only thing
+    standing between this and the wrong cluster. A y/N is too easy to
+    answer on autopilot.
+    """
+    if not sys.stdin.isatty():
+        _eprint("\nstdin is not a TTY and --yes was not given; declining to delete.")
+        return False
+    _destroy_summary(config, executor)
+    # Exact match: a padded name is a typo, not a confirmation.
+    typed = input(f"Type the cluster name ({config.cluster_name}) to confirm: ")
     if typed != config.cluster_name:
         _eprint("Name did not match; nothing was deleted.")
         return False
@@ -584,7 +616,9 @@ def cmd_destroy(args: argparse.Namespace) -> int:
         print("\nNothing was deleted. Re-run with --apply to execute.")
         return EXIT_OK
 
-    if not args.yes and not _confirm_destroy(config, executor):
+    if args.yes:
+        _destroy_summary(config, executor)
+    elif not _confirm_destroy(config, executor):
         return EXIT_DECLINED
 
     with executor.state.lock():
@@ -604,6 +638,9 @@ def cmd_destroy(args: argparse.Namespace) -> int:
         print("\nFix the cause and re-run `aro-hcp destroy --apply` — "
               "resources already gone are skipped.")
         return EXIT_FAILED
+    if executor.halted:
+        print("\nA delete is still in progress; re-run `aro-hcp destroy --apply` when it finishes.")
+        return EXIT_INCOMPLETE
     if args.phase:
         return EXIT_OK
 
@@ -670,7 +707,9 @@ def cmd_agent(args: argparse.Namespace) -> int:
     # deterministic checks as the equivalent CLI command before it starts.
     if args.apply:
         if args.destroy:
-            if not args.yes and not _confirm_destroy(config, executor):
+            if args.yes:
+                _destroy_summary(config, executor)
+            elif not _confirm_destroy(config, executor):
                 return EXIT_DECLINED
         else:
             report = run_preflight(executor.az, config, deep=True)
@@ -717,7 +756,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
     if stop == "refusal":
         return EXIT_FAILED
     # The model saying "done" is not the oracle; the plan's state is.
-    if getattr(result, "hit_turn_limit", False) or stop in ("max_tokens", "tool_use", None):
+    if getattr(result, "hit_turn_limit", False) or stop != "end_turn":
         _eprint(f"\nagent stopped before finishing ({stop or 'turn limit'}).")
         return EXIT_INCOMPLETE
     if args.apply:

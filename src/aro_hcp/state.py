@@ -45,6 +45,9 @@ def _now() -> str:
 _SECRET_PATTERNS = (
     re.compile(r"(?i)((?:password|secret|accountkey|sharedaccesssignature|sig|token)\s*[=:]\s*)[^\s;&\"']+"),
     re.compile(r"(?i)(\"(?:password|secret|value|key|token|connectionString)\"\s*:\s*\")[^\"]+"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
+    # A bare JWT: three base64url segments, the first starting with "eyJ".
+    re.compile(r"()eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
 )
 
 
@@ -180,6 +183,8 @@ class RunState:
 
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_path = self.path.with_name(self.path.name + ".lock")
+        # The lock file is left in place: unlinking it on release would let a
+        # third run lock a fresh inode while a second still waits on the old.
         handle = open(lock_path, "w")
         try:
             try:
@@ -188,10 +193,17 @@ class RunState:
                 raise StateLocked(
                     f"another aro-hcp run is using {self.path}; wait for it to finish"
                 ) from exc
+            # Another run may have finished between our load and our lock;
+            # pick up its records rather than overwrite them with a stale copy.
+            if self.path.exists():
+                fresh = RunState.load(self.path)
+                self.steps = {**fresh.steps, **{k: v for k, v in self.steps.items()
+                                               if k not in fresh.steps}}
+                self.context = {**fresh.context, **self.context}
+                self.history = fresh.history + [h for h in self.history if h not in fresh.history]
             yield self
         finally:
             handle.close()
-            lock_path.unlink(missing_ok=True)
 
     # -- queries ------------------------------------------------------------
 

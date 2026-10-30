@@ -352,8 +352,18 @@ def _clip(value: object, limit: int = 60) -> str:
 # -- inspect_azure policy ----------------------------------------------------
 
 
-def check_inspect_args(argv: list[str], subscription: str) -> str | None:
-    """Return why ``argv`` may not run under inspect_azure, or None if it may."""
+_RG_IN_ID = re.compile(r"/resourcegroups/([^/\s]+)", re.IGNORECASE)
+
+
+def check_inspect_args(
+    argv: list[str], subscription: str, resource_groups: tuple[str, ...] = (),
+) -> str | None:
+    """Return why ``argv`` may not run under inspect_azure, or None if it may.
+
+    ``resource_groups``, when given, pins lookups to this cluster's groups:
+    the agent diagnoses one cluster, and has no reason to read other teams'
+    resources in a shared subscription.
+    """
     # The command path is the positional tokens before the first flag.
     # Checking only that matters: `group create --name show` must not pass
     # just because "show" appears somewhere in the argv.
@@ -391,6 +401,24 @@ def check_inspect_args(argv: list[str], subscription: str) -> str | None:
         if not subscription or match.group(1).lower() != subscription.lower():
             return ("resource IDs must be in this run's subscription "
                     f"({subscription or 'unknown: set subscription_id in the config'})")
+    if resource_groups:
+        allowed = {g.lower() for g in resource_groups}
+        named: list[str] = []
+        for i, token in enumerate(flags):
+            name, _, inline = token.partition("=")
+            value = inline or (flags[i + 1] if i + 1 < len(flags) else "")
+            if name in ("-g", "--resource-group"):
+                named.append(value)
+            elif group == ("group",) and name in ("-n", "--name"):
+                named.append(value)
+        named += [m.group(1) for m in _RG_IN_ID.finditer(" ".join(flags))]
+        outside = [g for g in named if g and g.lower() not in allowed]
+        if outside:
+            return (f"resource group {outside[0]!r} is not this cluster's; inspect_azure "
+                    f"reads only {', '.join(sorted(resource_groups))}")
+        if group == ("group",) and verb == "list":
+            return "group list would read every resource group in the subscription; " \
+                   "use group show for this cluster's groups"
     return None
 
 
@@ -629,7 +657,9 @@ def build_tools(executor: Executor, config: ClusterConfig):
             return "no arguments given"
         if argv[0] == "az":
             argv = argv[1:]
-        problem = check_inspect_args(argv, subscription())
+        problem = check_inspect_args(
+            argv, subscription(), (config.resource_group, config.managed_resource_group),
+        )
         if problem:
             return f"rejected: {problem}"
         result = az.run(argv, check=False, force=True)

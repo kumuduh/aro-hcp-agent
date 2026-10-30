@@ -133,7 +133,7 @@ def test_D3_already_exists_for_another_resource_is_a_failure(tmp_path):
     assert outcome.status == "failed"
 
 
-def test_D3_role_assignment_exists_is_trusted_only_when_the_probe_agrees(tmp_path):
+def test_D3_role_assignment_exists_is_benign_even_while_the_list_lags(tmp_path):
     ex = executor(tmp_path, az=FakeAzure(errors={
         "role assignment create": (1, "", "(RoleAssignmentExists) The role assignment already exists."),
         "role assignment list": (0, "", ""),
@@ -141,9 +141,9 @@ def test_D3_role_assignment_exists_is_trusted_only_when_the_probe_agrees(tmp_pat
     first = next(s for s in ex.plan if s.phase == "role-assignments")
     ex.context.update({k: "v" for k in first.requires})
     outcome = ex.run_step(first)
-    # The step has a probe, and the probe finds no assignment: the conflict
-    # was about something else, so it is not "already done".
-    assert outcome.status == "failed"
+    # Azure says RoleAssignmentExists only about the assignment being
+    # created; an empty list right after is propagation lag.
+    assert outcome.status == "skipped"
 
 
 # -- D15 / O4: probe errors are unknown ------------------------------------------
@@ -176,7 +176,7 @@ def test_O4_a_failed_create_probe_does_not_trigger_a_create(tmp_path, err):
 
 
 def test_N1_exhausted_retry_on_delete_is_not_reported_gone(tmp_path):
-    az = FakeAzure({"identity:demo-cp-kms": "/id"},
+    az = FakeAzure({"identity:demo-cp-kms": f"/subscriptions/{SUB}/x"},
                    errors={"identity delete": (1, "", "Principal does not exist in the directory")})
     ex = executor(tmp_path, plan=build_destroy_plan(make_config()), az=az)
     ex.state.record("cluster-delete", "done")
@@ -194,7 +194,7 @@ def test_D1_recorded_deletes_are_reverified_and_redone(tmp_path):
     for s in plan:
         stale.record(s.id, "done")
     stale.save()
-    az = FakeAzure({"aro hcp cluster:demo": "/cluster"})
+    az = FakeAzure({"aro hcp cluster:demo": f"/subscriptions/{SUB}/x"})
     ex = executor(tmp_path, plan=plan, az=az, state_name="d.json")
     ex.run_all()
     assert any(c[:4] == ["aro", "hcp", "cluster", "delete"] for c in az.calls)
@@ -221,14 +221,14 @@ def test_D1_cli_destroy_removes_both_state_files(tmp_path, monkeypatch):
 @pytest.mark.parametrize("step_id", ["keyvault-delete", "keyvault-purge", "identity-delete-cp-kms",
                                      "vnet-delete", "resource-group-delete"])
 def test_D26_nothing_after_the_cluster_runs_while_it_exists(tmp_path, step_id):
-    az = FakeAzure({"aro hcp cluster:demo": "/cluster", "keyvault:demo-kv": "/kv"})
+    az = FakeAzure({"aro hcp cluster:demo": f"/subscriptions/{SUB}/x", "keyvault:demo-kv": f"/subscriptions/{SUB}/x"})
     ex = executor(tmp_path, plan=build_destroy_plan(make_config()), az=az)
     with pytest.raises(StepBlocked):
         ex.run_step(step(ex, step_id))
 
 
 def test_D26_keep_going_past_a_failed_cluster_delete_purges_nothing(tmp_path):
-    az = FakeAzure({"aro hcp cluster:demo": "/cluster", "keyvault:demo-kv": "/kv"},
+    az = FakeAzure({"aro hcp cluster:demo": f"/subscriptions/{SUB}/x", "keyvault:demo-kv": f"/subscriptions/{SUB}/x"},
                    errors={"aro hcp cluster delete": (1, "", "InternalServerError")})
     ex = executor(tmp_path, plan=build_destroy_plan(make_config()), az=az)
     ex.run_all(stop_on_error=False)
@@ -424,3 +424,39 @@ def test_live_regression_probe_waits_out_rbac_propagation(tmp_path):
     outcome = ex.run_step(step(ex, "kms-key-create"))
     assert outcome.status == "done"
     assert any(c[:3] == ["keyvault", "key", "create"] for c in az.calls)
+
+
+def test_D3_generic_already_exists_needs_the_probe_to_agree(tmp_path):
+    az = FakeAzure(errors={"network nsg create": (1, "", "(Conflict) Another resource already exists")})
+    ex = executor(tmp_path, az=az)
+    assert ex.run_step(step(ex, "nsg-create")).status == "failed"
+
+
+def test_non_id_probe_output_is_unknown_not_present(tmp_path):
+    az = FakeAzure(errors={"network nsg show": (0, "<html>proxy error</html>", "")})
+    ex = executor(tmp_path, az=az)
+    assert ex.run_step(step(ex, "nsg-create")).status == "failed"
+
+
+def test_delete_timeout_while_still_present_is_in_progress(tmp_path):
+    az = FakeAzure({"aro hcp cluster:demo": f"/subscriptions/{SUB}/x"},
+                   errors={"aro hcp cluster delete": (124, "", "timed out after 2700s")})
+    ex = executor(tmp_path, plan=build_destroy_plan(make_config()), az=az)
+    outcome = ex.run_step(step(ex, "cluster-delete"))
+    assert outcome.status == "pending" and ex.halted
+
+
+def test_bearer_tokens_and_jwts_are_redacted():
+    from aro_hcp.state import redact
+    jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4eHh4eHh4In0.c2lnbmF0dXJlc2lnbmF0dXJl"
+    out = redact(f"Authorization: Bearer abc.def.ghi and {jwt}")
+    assert "abc.def.ghi" not in out and jwt not in out
+
+
+def test_lock_picks_up_records_written_after_load(tmp_path):
+    a = RunState.load(tmp_path / "s.json")
+    b = RunState(path=tmp_path / "s.json")
+    b.record("written-by-b", "done")
+    b.save()
+    with a.lock():
+        assert a.is_complete("written-by-b")

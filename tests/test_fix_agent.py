@@ -112,7 +112,7 @@ def test_inspect_rejects_secret_families(tmp_path, args):
 
 @pytest.mark.parametrize("args", [
     "group show --name demo-rg",
-    "az group list",
+    "az group show --name demo-rg",
     "network vnet subnet show --name worker-subnet --vnet-name v -g demo-rg",
     "network nsg show --name demo-nsg -g demo-rg",
     "identity list -g demo-rg",
@@ -130,7 +130,7 @@ def test_inspect_rejects_secret_families(tmp_path, args):
     "account show",
     "monitor activity-log list -g demo-rg --offset 1h",
     f"resource show --ids /subscriptions/{SUB}/resourceGroups/demo-rg",
-    f"group list --subscription {SUB}",
+    f"group show --name demo-rg --subscription {SUB}",
 ])
 def test_inspect_allows_aro_hcp_metadata_reads(tmp_path, args):
     result, az = inspect(tmp_path, args)
@@ -170,7 +170,7 @@ def test_inspect_rejects_logging_and_file_flags(tmp_path, args):
 
 
 def test_inspect_allows_only_show_errors(tmp_path):
-    result, az = inspect(tmp_path, "group list --only-show-errors")
+    result, az = inspect(tmp_path, "group show -n demo-rg --only-show-errors")
     assert not result.startswith("rejected")
 
 
@@ -465,3 +465,14 @@ def test_empty_run_is_not_ok(tmp_path, fake_client):
     executor, config = _executor(tmp_path)
     result = run_agent(executor, config, "x")
     assert result.stop_reason is None and not result.ok
+
+
+@pytest.mark.parametrize("args", [
+    "group show --name some-other-teams-rg",
+    "network vnet list -g some-other-teams-rg",
+    f"resource show --ids /subscriptions/{SUB}/resourceGroups/other-rg/providers/x/y/z",
+    "group list",
+])
+def test_inspect_is_pinned_to_this_clusters_resource_groups(tmp_path, args):
+    result, az = inspect(tmp_path, args)
+    assert result.startswith("rejected"), result

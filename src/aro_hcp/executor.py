@@ -223,6 +223,9 @@ class Executor:
                 self._record(step.id, state_mod.FAILED, command=command, detail=message)
                 return StepOutcome(step, state_mod.FAILED, command, message=message)
             if (found == ABSENT) is step.deletes and self._ready(step, text) is not False:
+                if step.expect is not None and not step.deletes and text != step.expect:
+                    # Changed out of band since it was built.
+                    return self._existing(step, command, text)
                 self._capture(step, AzResult([], 0, text, ""))
                 return StepOutcome(step, state_mod.SKIPPED, command, stdout=text,
                                    message="verified against Azure")
@@ -379,6 +382,11 @@ class Executor:
             self.sleep(delay)
             probe = runner.run(argv, check=False, force=True)
         if probe.ok:
+            if (probe.text and "--query" in argv and argv[argv.index("--query") + 1] == "id"
+                    and not probe.text.startswith("/subscriptions/")):
+                # A resource id query answered with something that is not an
+                # id (an HTML error page from a proxy) proves nothing.
+                return UNKNOWN, "", f"unexpected probe output: {probe.text[:120]}"
             return (PRESENT if probe.text else ABSENT), probe.text, ""
         err = probe.stderr.strip() or probe.stdout.strip() or f"exit {probe.returncode}"
         if self._is_transient(probe) or probe.returncode == 124:
@@ -472,6 +480,21 @@ class Executor:
 
     def _failed(self, step: Step, command: str, result: AzResult) -> StepOutcome:
         detail = result.stderr.strip() or result.stdout.strip()
+        if step.deletes and result.returncode == 124 and step.exists is not None:
+            # The client gave up, but Azure keeps deleting. Report it as in
+            # progress, not as a failure to be retried blindly.
+            found, _text, _err = self._probe(step)
+            if found == PRESENT:
+                self.halted = True
+                self.on_event(f"hold  {step.id}: still deleting")
+                return StepOutcome(step, state_mod.PENDING, command,
+                                   message="the delete is still in progress; re-run when it finishes")
+        if not step.deletes and self._matches(result, _BENIGN_UNPROBED):
+            # Azure only says this about the assignment being created; a list
+            # that does not show it yet is lag, not contradiction.
+            self._record(step.id, state_mod.SKIPPED, command=command, detail=detail)
+            return StepOutcome(step, state_mod.SKIPPED, command, stderr=result.stderr,
+                               message="already exists")
         # A retry budget exhausted on propagation lag is still a failure, even
         # when its text also contains a "not found" phrase.
         if not self._is_transient(result):
