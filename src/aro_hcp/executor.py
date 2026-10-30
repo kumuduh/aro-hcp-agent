@@ -360,10 +360,24 @@ class Executor:
     # -- helpers ------------------------------------------------------------
 
     def _probe(self, step: Step) -> tuple[str, str, str]:
-        """Return (PRESENT|ABSENT|UNKNOWN, stdout, error) for the step's resource."""
-        probe = self.runner_for(step).run(
-            step.render_exists(self.context), check=False, force=True
-        )
+        """Return (PRESENT|ABSENT|UNKNOWN, stdout, error) for the step's resource.
+
+        Propagation lag hits probes as well as writes: the probe for the KMS
+        key runs moments after this run granted itself Crypto Officer, and the
+        vault's data plane answers ForbiddenByRbac until the grant arrives. So
+        a transient probe error is retried on the same backoff before it is
+        reported as "unknown".
+        """
+        argv = step.render_exists(self.context)
+        runner = self.runner_for(step)
+        probe = runner.run(argv, check=False, force=True)
+        for delay in self.retry_delays:
+            if probe.ok or not self._is_transient(probe):
+                break
+            self.on_event(f"wait  {step.id}: Azure is still propagating permissions; "
+                          f"checking again in {delay}s")
+            self.sleep(delay)
+            probe = runner.run(argv, check=False, force=True)
         if probe.ok:
             return (PRESENT if probe.text else ABSENT), probe.text, ""
         err = probe.stderr.strip() or probe.stdout.strip() or f"exit {probe.returncode}"

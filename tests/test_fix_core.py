@@ -403,3 +403,24 @@ def test_D20_az_creates_carry_config_tags():
     creates = [s for s in plan if s.args[-2:] == ["--tags", "env=qa"] or "env=qa" in s.args]
     names = {s.id for s in creates}
     assert {"resource-group", "nsg-create", "vnet-create", "keyvault-create", "cluster-create"} <= names
+
+
+def test_live_regression_probe_waits_out_rbac_propagation(tmp_path):
+    """Found live: the KMS key probe right after the Crypto Officer grant gets
+    ForbiddenByRbac. It must be retried, not reported as unknown/failed."""
+    responses = [(1, "", "(Forbidden) ... Inner error: {\"code\": \"ForbiddenByRbac\"}")] * 2
+
+    class Lagging(FakeAzure):
+        def run(self, args, **kw):
+            if args[:3] == ["keyvault", "key", "show"] and responses:
+                self.calls.append(list(args))
+                return AzResult(list(args), *responses.pop(0))
+            return super().run(args, **kw)
+
+    az = Lagging()
+    config = make_config()
+    ex = Executor(config, build_plan(config), az, RunState(path=tmp_path / "s.json"), apply=True,
+                  retry_delays=(1, 1, 1), sleep=lambda _s: None, poll_interval=0)
+    outcome = ex.run_step(step(ex, "kms-key-create"))
+    assert outcome.status == "done"
+    assert any(c[:3] == ["keyvault", "key", "create"] for c in az.calls)
