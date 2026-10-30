@@ -16,7 +16,10 @@ dependencies = [
 [project.optional-dependencies]
 # Only `aro-hcp agent` needs the SDK, and it imports it lazily. Everyone
 # driving the deterministic subcommands skips the install.
-agent = ["anthropic>=0.69"]
+# Capped below 2: the 2.x tool_runner sends a request field (`thread`) that
+# Anthropic-compatible gateways reached through ANTHROPIC_BASE_URL (e.g.
+# Vertex) reject, so `aro-hcp agent` failed on its first call. 0.84 works.
+agent = ["anthropic>=0.69,<2"]
 
 [project.urls]
 Homepage = "https://github.com/kumuduh/aro-hcp-agent"
@@ -26,7 +29,8 @@ Issues = "https://github.com/kumuduh/aro-hcp-agent/issues"
 dev = [
     "pytest>=8.0",
     # The agent guardrail tests exercise build_tools(), which needs the SDK.
-    "anthropic>=0.69",
+    # Same cap as the [agent] extra; see the comment there.
+    "anthropic>=0.69,<2",
 ]
 
 [project.scripts]
