@@ -13,8 +13,8 @@ DEFAULT_TIMEOUT = 300
 # `az aro hcp cluster create` routinely runs 15-20 minutes.
 LONG_TIMEOUT = 2700
 
-# Command groups that must not carry --subscription.
-_NO_SUBSCRIPTION = {"account", "extension", "login", "logout"}
+# Command groups that must not carry --subscription (Entra ID commands reject it).
+_NO_SUBSCRIPTION = {"account", "ad", "extension", "login", "logout"}
 
 
 class AzNotFound(RuntimeError):
