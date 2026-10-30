@@ -24,6 +24,7 @@ from .terraform import (
     build_terraform_destroy_plan,
     build_terraform_plan,
     make_runner,
+    plan_json,
 )
 
 #: --phase accepts any phase from any backend at parse time; _setup rejects
@@ -414,6 +415,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
     phases = args.phase or None
     if config.backend == "terraform" and not args.json:
         return _terraform_plan(executor, phases)
+    if config.backend == "terraform":
+        return _terraform_plan_json(args, config, executor)
     rows = executor.render_plan(phases)
     if args.json:
         print(json.dumps({
@@ -448,6 +451,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _terraform_plan_json(args, config: ClusterConfig, executor: Executor) -> int:
+    """`plan --json` on terraform: the real resource diff, not the wrapper's steps."""
+    outcomes = executor.run_all(["workspace", "init"], stop_on_error=True)
+    failed = [o for o in outcomes if o.status == state_mod.FAILED]
+    if failed:
+        _print_failures(failed)
+        return EXIT_FAILED
+    try:
+        print(json.dumps(plan_json(config, executor.runners["terraform"], args.state_dir or None),
+                         indent=2))
+    except Exception as exc:  # AzError from terraform, reported cleanly
+        _eprint(f"terraform plan failed: {exc}")
+        return EXIT_FAILED
+    return EXIT_OK
+
+
 def _terraform_plan(executor: Executor, phases) -> int:
     """Run the real `terraform plan`.
 
@@ -471,6 +490,9 @@ def _terraform_plan(executor: Executor, phases) -> int:
             print(outcome.stdout or outcome.message)
         elif step.mutating and outcome.status == state_mod.PENDING:
             print(f"[hold] {step.id}: {step.description}")
+        elif outcome.status == state_mod.PENDING:
+            # A lookup of something the apply has not created yet.
+            print(f"[wait] {step.id}: {outcome.message or step.description}")
         elif step.action:
             # Actions report one useful line; terraform's own banners do not.
             print(f"[ok  ] {step.id}: {outcome.stdout.strip()}")
@@ -572,8 +594,10 @@ def cmd_destroy(args: argparse.Namespace) -> int:
     failed = [o for o in outcomes if o.status == state_mod.FAILED]
     # Only steps that delete something count as deletions; fetching the
     # module or running init is bookkeeping.
-    deleted = [o for o in outcomes if o.status == state_mod.DONE and o.step.deletes]
-    gone = [o for o in outcomes if o.status == state_mod.SKIPPED and o.step.deletes]
+    deleted = [o for o in outcomes if o.status == state_mod.DONE and o.step.deletes
+               and "bookkeeping" not in o.step.tags]
+    gone = [o for o in outcomes if o.status == state_mod.SKIPPED and o.step.deletes
+            and "bookkeeping" not in o.step.tags]
     print(f"\n{len(deleted)} deleted, {len(gone)} already gone, {len(failed)} failed.")
     _print_failures(failed)
     if failed:
