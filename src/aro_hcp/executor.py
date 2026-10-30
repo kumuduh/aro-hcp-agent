@@ -127,11 +127,18 @@ class Executor:
         self._confirmed_phases: set[str] = set()
         #: Set when the operator declines a phase; the rest of the run stops.
         self.declined = False
+        #: Set when a long-running operation is still in progress; the run
+        #: stops so nothing is built on a resource that is not ready yet.
+        self.halted = False
         #: A dry run must not leave a state file claiming work was done.
         self.persist = apply
 
         self.state.bind(config.cluster_name, config.subscription_id or "", fingerprint or {})
         for key, value in config.base_context().items():
+            # On the terraform backend the module names the vault itself; the
+            # az-derived name must not sit in context posing as the real one.
+            if config.backend == "terraform" and key in ("KEYVAULT_NAME", "KMS_KEY_NAME"):
+                continue
             self.state.set_context(key, value)
 
     # -- context ------------------------------------------------------------
@@ -147,7 +154,9 @@ class Executor:
         wanted = set(phases) if phases else None
         return [
             s for s in self.plan
-            if (wanted is None or s.phase in wanted) and not self.state.is_complete(s.id)
+            if (wanted is None or s.phase in wanted)
+            and not self.state.is_complete(s.id)
+            and not (self._always(s) and not s.mutating)
         ]
 
     # -- rendering ----------------------------------------------------------
@@ -179,6 +188,10 @@ class Executor:
 
     # -- execution ----------------------------------------------------------
 
+    @staticmethod
+    def _always(step: Step) -> bool:
+        return step.always or "always" in step.tags
+
     def _reverify(self, step: Step) -> bool:
         """True if a completed step should be re-checked against Azure."""
         return self.apply and step.exists is not None and step.mutating
@@ -193,7 +206,7 @@ class Executor:
 
         command = self.render(step)
 
-        if self.state.is_complete(step.id) and not force and not step.always:
+        if self.state.is_complete(step.id) and not force and not self._always(step):
             recorded = self.state.status(step.id)
             # Outside apply, a recorded result is all a report needs. During an
             # apply, a recorded delete or create is re-checked against Azure:
@@ -293,7 +306,7 @@ class Executor:
                 continue
             # Outside apply, completed steps are left alone; during an apply
             # run_step re-verifies them against Azure.
-            if (self.state.is_complete(step.id) and not step.always
+            if (self.state.is_complete(step.id) and not self._always(step)
                     and not self._reverify(step)):
                 continue
             try:
@@ -304,7 +317,7 @@ class Executor:
                 outcome = StepOutcome(step, state_mod.FAILED, self.render(step),
                                       message=f"blocked: {exc.reason}")
             outcomes.append(outcome)
-            if self.declined:
+            if self.declined or self.halted:
                 break
             if outcome.status == state_mod.FAILED and stop_on_error:
                 break
@@ -323,10 +336,22 @@ class Executor:
                 continue
             if step.phase not in seen:
                 seen.append(step.phase)
+        if wanted and seen:
+            # A phase-scoped run still refreshes what it builds on: earlier
+            # phases' always-steps (reads, terraform workspace/init/plan) run
+            # first, so `--phase apply` never applies against stale tfvars and
+            # `--phase cluster` never uses stale captured IDs.
+            first = next(i for i, s in enumerate(self.plan) if s.phase == seen[0])
+            for step in self.plan[:first]:
+                if self._always(step) and step.phase not in seen:
+                    outcome = self.run_step(step)
+                    outcomes.append(outcome)
+                    if outcome.status == state_mod.FAILED and stop_on_error:
+                        return outcomes
         for phase in seen:
             phase_outcomes = self.run_phase(phase, stop_on_error=stop_on_error)
             outcomes += phase_outcomes
-            if self.declined:
+            if self.declined or self.halted:
                 break
             if stop_on_error and any(o.status == state_mod.FAILED for o in phase_outcomes):
                 break
@@ -359,10 +384,7 @@ class Executor:
         """The create's resource already exists: decide whether that is done."""
         if step.ready_states:
             if text in IN_PROGRESS_STATES:
-                if not self.apply:
-                    return StepOutcome(step, state_mod.PENDING, command,
-                                       message=f"exists, still {text}")
-                text = self._wait_while_in_progress(step, text)
+                return self._in_progress(step, command, text)
             if text not in step.ready_states:
                 message = (
                     f"the resource already exists in state {text!r}, which is not "
@@ -390,39 +412,42 @@ class Executor:
         self.on_event(f"skip  {step.id}: already present")
         return StepOutcome(step, state_mod.SKIPPED, command, stdout=text, message="already present")
 
-    def _wait_while_in_progress(self, step: Step, text: str) -> str:
-        """Poll a create's probe until it leaves the in-progress states or times out."""
-        waited = 0.0
-        while text in IN_PROGRESS_STATES and waited < step.timeout:
-            self.on_event(f"wait  {step.id}: still {text}; checking again in {self.poll_interval:.0f}s")
-            self.sleep(self.poll_interval)
-            waited += self.poll_interval
-            found, text, _err = self._probe(step)
-            if found != PRESENT:
-                return text or found
-        return text
+    def _in_progress(self, step: Step, command: str, text: str) -> StepOutcome:
+        """The resource exists but its long-running operation has not finished.
+
+        Never "done": that is how a still-provisioning cluster was reported as
+        provisioned and a node pool was sent at it. The run stops here instead
+        of blocking for up to the step timeout; re-running apply resumes.
+        """
+        message = (f"the resource exists but is still {text}; re-run apply when the "
+                   "operation finishes")
+        if self.apply:
+            self.halted = True
+            self.on_event(f"hold  {step.id}: still {text}")
+        return StepOutcome(step, state_mod.PENDING, command, stdout=text, message=message)
 
     def _settle(self, step: Step, command: str) -> StepOutcome | None:
         """After a successful command, confirm Azure agrees. None means it does."""
         if step.deletes:
             # A delete that returned 0 is not proof the resource is gone; some
             # deletes return before the resource disappears.
-            waited = 0.0
-            while True:
+            # The az deletes used here wait for completion, so a short grace
+            # period covers read-after-delete lag; anything longer is a failure
+            # to report, not something to block on.
+            for attempt in range(3):
                 found, _text, err = self._probe(step)
                 if found == ABSENT:
                     return None
-                if waited >= step.timeout:
-                    message = ("delete returned success but the resource is still "
-                               + ("present" if found == PRESENT else f"unverifiable: {err}"))
-                    self._record(step.id, state_mod.FAILED, command=command, detail=message)
-                    return StepOutcome(step, state_mod.FAILED, command, message=message)
-                self.sleep(self.poll_interval)
-                waited += self.poll_interval
+                if attempt < 2:
+                    self.sleep(self.poll_interval)
+            message = ("delete returned success but the resource is still "
+                       + ("present" if found == PRESENT else f"unverifiable: {err}"))
+            self._record(step.id, state_mod.FAILED, command=command, detail=message)
+            return StepOutcome(step, state_mod.FAILED, command, message=message)
         if step.ready_states:
             found, text, err = self._probe(step)
             if found == PRESENT and text in IN_PROGRESS_STATES:
-                text = self._wait_while_in_progress(step, text)
+                return self._in_progress(step, command, text)
             if text not in step.ready_states:
                 message = (f"create returned but the resource is in state {text or found!r}"
                            + (f": {err}" if err else ""))
@@ -574,11 +599,20 @@ class Executor:
 
 
 def resolve_signed_in_user(az: AzCli, run_state: RunState) -> str:
-    """Populate ``SIGNED_IN_USER``, needed by the Key Vault Crypto Officer grant."""
+    """Populate ``SIGNED_IN_USER``, needed by the Key Vault Crypto Officer grant.
+
+    The object id is preferred over ``account show``'s user name: under a
+    managed-identity login that name is the literal "systemAssignedIdentity",
+    which is not a principal and made the grant fail late. When no assignee
+    can be resolved the variable stays unset, so the grant fails up front as
+    "unresolved" (and preflight has already said why).
+    """
+    from .preflight import _resolve_principal  # local: preflight imports config only
+
     existing = run_state.get("SIGNED_IN_USER")
     if existing:
         return existing
-    user = az.signed_in_user()
-    if user:
-        run_state.set_context("SIGNED_IN_USER", user)
-    return user or ""
+    assignee, _kind = _resolve_principal(az)
+    if assignee:
+        run_state.set_context("SIGNED_IN_USER", assignee)
+    return assignee

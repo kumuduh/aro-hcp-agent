@@ -209,7 +209,13 @@ def test_plan_phases_are_in_order():
 
 
 def test_every_terraform_step_uses_the_terraform_runner():
+    """Except the D31 workaround, whose role grants are az commands."""
+    from aro_hcp.terraform import D31_TAG
+
     for step in build_terraform_plan(make_config()) + build_terraform_destroy_plan(make_config()):
+        if D31_TAG in step.tags:
+            assert step.runner in ("az", "terraform"), step.id
+            continue
         assert step.runner == "terraform", step.id
 
 
@@ -221,7 +227,10 @@ def test_az_plan_steps_still_use_the_az_runner():
 def test_only_apply_is_mutating():
     """Everything up to apply touches only the local work directory, which is
     what lets `plan` run a real terraform plan."""
-    mutating = [s.id for s in build_terraform_plan(make_config()) if s.mutating]
+    from aro_hcp.terraform import D31_TAG
+
+    mutating = [s.id for s in build_terraform_plan(make_config())
+                if s.mutating and D31_TAG not in s.tags]
     assert mutating == ["tf-apply"]
 
 

@@ -443,7 +443,8 @@ def test_turn_limit_and_pending_reported(tmp_path, fake_client):
     executor, config = _executor(tmp_path, apply=True)
     result = run_agent(executor, config, "x", max_turns=2)
     assert result.hit_turn_limit and result.turns == 2 and not result.ok
-    assert result.pending == [s.id for s in executor.plan]
+    assert result.pending == [s.id for s in executor.pending()]
+    assert result.pending  # nothing ran, so creates are still pending
 
 
 def test_finishing_on_the_last_allowed_turn_is_not_a_limit_hit(tmp_path, fake_client):

@@ -688,12 +688,12 @@ def cmd_agent(args: argparse.Namespace) -> int:
         executor.state.save()
 
     stop = getattr(result, "stop_reason", None)
-    if args.quiet or stop == "refusal":
+    if args.quiet:
         print(result.text)
     if stop == "refusal":
         return EXIT_FAILED
     # The model saying "done" is not the oracle; the plan's state is.
-    if getattr(result, "hit_turn_limit", False) or stop == "max_tokens":
+    if getattr(result, "hit_turn_limit", False) or stop in ("max_tokens", "tool_use", None):
         _eprint(f"\nagent stopped before finishing ({stop or 'turn limit'}).")
         return EXIT_INCOMPLETE
     if args.apply:
@@ -718,7 +718,7 @@ def _run_agent(run_agent, executor, config, instruction, args):
         model=args.model,
         max_turns=args.max_turns,
         destroy=args.destroy,
-        on_text=lambda text: print(text, flush=True),
+        on_text=None if args.quiet else (lambda text: print(text, flush=True)),
     )
 
 

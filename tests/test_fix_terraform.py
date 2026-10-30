@@ -450,7 +450,9 @@ def test_d31_failed_lookup_stops_before_full_apply(tmp_path):
     executor = make_executor(tmp_path, tf=tf, az=az)
     outcomes = executor.run_all(["apply"])
     assert outcomes[-1].status == "failed" and outcomes[-1].step.id == "tf-d31-vnet-id"
-    assert [c for c in tf.calls if c[0] == "apply"] == [tf.calls[0]]
+    applies = [c for c in tf.calls if c[0] == "apply"]
+    # Only the targeted stage-1 apply ran; the full apply never started.
+    assert len(applies) == 1 and "-target=module.network" in applies[0]
 
 
 # -- TFX1: bookkeeping steps ----------------------------------------------------------
@@ -477,7 +479,10 @@ def test_az_derived_vault_name_is_dropped_before_outputs(tmp_path):
     module.mkdir()
     (module / "variables.tf").write_text("")
     executor = make_executor(tmp_path, make_config(terraform_dir=str(module)))
-    assert executor.context["KEYVAULT_NAME"] == "demo-kv"  # seeded by base_context
+    # The executor no longer seeds the az-derived name on this backend; a
+    # state written by an older release may still carry it.
+    assert "KEYVAULT_NAME" not in executor.context
+    executor.state.set_context("KEYVAULT_NAME", "demo-kv")
     tf_mod.action_fetch_module(executor, step(executor, "tf-fetch-module"))
     assert "KEYVAULT_NAME" not in executor.context
 
