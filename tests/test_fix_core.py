@@ -106,13 +106,32 @@ def test_D2_terminal_cluster_state_is_a_failure_not_done(tmp_path, state):
     assert state in outcome.message
 
 
-def test_D2_in_progress_cluster_halts_the_run_without_claiming_success(tmp_path):
+def test_D2_in_progress_cluster_that_never_finishes_halts_without_claiming_success(tmp_path):
     az = FakeAzure({"aro hcp cluster:demo": "Provisioning"})
     ex = executor(tmp_path, az=az)
+    ex.poll_interval = 1000  # three polls exhaust the step timeout
     ex.context.update({k: "v" for k in step(ex, "cluster-create").requires})
     outcome = ex.run_step(step(ex, "cluster-create"))
     assert outcome.status == "pending" and ex.halted
     assert not ex.state.is_complete("cluster-create")
+
+
+def test_D2_in_progress_cluster_is_waited_for_until_it_succeeds(tmp_path):
+    """Seen live: cluster create returns while the cluster is still Accepted."""
+    states = ["Accepted", "Provisioning", "Succeeded"]
+
+    class Settling(FakeAzure):
+        def run(self, args, **kw):
+            if args[:4] == ["aro", "hcp", "cluster", "show"]:
+                self.calls.append(list(args))
+                return AzResult(list(args), 0, states.pop(0) if len(states) > 1 else states[0], "")
+            return super().run(args, **kw)
+
+    az = Settling({})
+    ex = executor(tmp_path, az=az)
+    ex.context.update({k: "v" for k in step(ex, "cluster-create").requires})
+    outcome = ex.run_step(step(ex, "cluster-create"))
+    assert outcome.status == "skipped" and not ex.halted  # waited, then Succeeded
 
 
 def test_D2_node_pool_is_blocked_until_the_cluster_is_ready(tmp_path):

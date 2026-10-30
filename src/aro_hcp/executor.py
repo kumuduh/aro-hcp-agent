@@ -406,7 +406,12 @@ class Executor:
         """The create's resource already exists: decide whether that is done."""
         if step.ready_states:
             if text in IN_PROGRESS_STATES:
-                return self._in_progress(step, command, text)
+                if not self.apply:
+                    return self._in_progress(step, command, text)
+                # Usually our own create from an interrupted run: wait for it.
+                text = self._wait_while_in_progress(step, text)
+                if text in IN_PROGRESS_STATES:
+                    return self._in_progress(step, command, text)
             if text not in step.ready_states:
                 message = (
                     f"the resource already exists in state {text!r}, which is not "
@@ -433,6 +438,26 @@ class Executor:
         self._capture(step, AzResult([], 0, text, ""))
         self.on_event(f"skip  {step.id}: already present")
         return StepOutcome(step, state_mod.SKIPPED, command, stdout=text, message="already present")
+
+    def _wait_while_in_progress(self, step: Step, text: str) -> str:
+        """Poll a create's probe until it leaves the in-progress states.
+
+        `az aro hcp cluster create` can return while the cluster is still
+        Accepted. Waiting here, bounded by the step's timeout, is what lets a
+        single apply finish; giving up hands over to _in_progress.
+        """
+        waited = 0.0
+        while text in IN_PROGRESS_STATES and waited < step.timeout:
+            self.on_event(f"wait  {step.id}: still {text}; checking again in "
+                          f"{self.poll_interval:.0f}s")
+            self.sleep(self.poll_interval)
+            waited += max(self.poll_interval, 1)
+            found, new, _err = self._probe(step)
+            if found == PRESENT:
+                text = new
+            elif found == ABSENT:
+                return ""
+        return text
 
     def _in_progress(self, step: Step, command: str, text: str) -> StepOutcome:
         """The resource exists but its long-running operation has not finished.
@@ -469,7 +494,9 @@ class Executor:
         if step.ready_states:
             found, text, err = self._probe(step)
             if found == PRESENT and text in IN_PROGRESS_STATES:
-                return self._in_progress(step, command, text)
+                text = self._wait_while_in_progress(step, text)
+                if text in IN_PROGRESS_STATES:
+                    return self._in_progress(step, command, text)
             if text not in step.ready_states:
                 message = (f"create returned but the resource is in state {text or found!r}"
                            + (f": {err}" if err else ""))
