@@ -479,3 +479,16 @@ def test_lock_picks_up_records_written_after_load(tmp_path):
     b.save()
     with a.lock():
         assert a.is_complete("written-by-b")
+
+
+def test_live_regression_teardown_of_a_private_cluster_needs_no_flag(tmp_path, monkeypatch):
+    """Found live: D18 validation refused `destroy` of a private-vault cluster
+    when --keyvault-private-endpoint was omitted. Cleanup must not be blocked."""
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"cluster_name: demo\nlocation: eastus2\nresource_group: demo-rg\n"
+                   f"cluster_version: '4.22'\nnodepool_version: '4.22.1'\nsubscription_id: {SUB}\n"
+                   "vault_visibility: Private\n")
+    monkeypatch.setattr(cli, "AzCli", lambda *a, **k: FakeAzure())
+    assert cli.main(["destroy", "-c", str(cfg), "--state-dir", str(tmp_path)]) == cli.EXIT_OK
+    # The build still requires the flag.
+    assert cli.main(["plan", "-c", str(cfg), "--state-dir", str(tmp_path)]) == cli.EXIT_USAGE

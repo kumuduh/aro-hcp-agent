@@ -184,6 +184,12 @@ def _setup(
     args: argparse.Namespace, *, apply: bool, destroy: bool = False
 ) -> tuple[ClusterConfig, Executor]:
     config = _load_config(args)
+    if (destroy and config.backend != "terraform" and config.vault_visibility == "Private"
+            and not config.keyvault_private_endpoint):
+        # The flag guards a build against a "Private" setting on a public
+        # vault. Teardown handles the private endpoint whether or not it was
+        # passed, and must never be blocked by forgetting it.
+        config = config.with_overrides(keyvault_private_endpoint=True)
     config.require_valid()
 
     terraform = config.backend == "terraform"
