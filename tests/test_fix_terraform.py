@@ -175,7 +175,10 @@ def test_cached_checkout_at_exact_ref_is_reused(tmp_path, monkeypatch):
     monkeypatch.setattr(tf_mod, "_git", git)
     result = tf_mod.action_fetch_module(executor, step(executor, "tf-fetch-module"))
     assert result.ok and "already at" in result.stdout
-    assert "fetch" not in git.subcommands() and "checkout" not in git.subcommands()
+    assert "fetch" not in git.subcommands()
+    # No commit is checked out; only the lock file is reset to its committed copy.
+    assert [c for c in git.calls if c[0] == "checkout"] == [
+        ("checkout", "--", "terraform/.terraform.lock.hcl")]
 
 
 def test_dirty_checkout_refused(tmp_path, monkeypatch):
@@ -754,3 +757,41 @@ def test_dry_run_does_not_claim_the_applies_wait_for_a_plan_that_ran(tmp_path):
     executor.on_event = events.append
     executor.run_all(["plan", "apply"], stop_on_error=False)
     assert not [e for e in events if "waits for tf-plan" in e]
+
+
+# -- found live on macOS: init edits the module's lock file -----------------------
+
+
+def test_only_the_lock_file_may_differ_in_a_cached_checkout(tmp_path, monkeypatch):
+    lock_only = FakeGit(responses={"status": (0, " M terraform/.terraform.lock.hcl\n", "")})
+    monkeypatch.setattr(tf_mod, "_git", lock_only)
+    assert tf_mod._verify_existing_checkout(tmp_path) == ""
+    edited = FakeGit(responses={"status": (0, " M terraform/.terraform.lock.hcl\n"
+                                              " M terraform/main.tf\n", "")})
+    monkeypatch.setattr(tf_mod, "_git", edited)
+    problem = tf_mod._verify_existing_checkout(tmp_path)
+    assert "terraform/main.tf" in problem and "lock.hcl" not in problem
+
+
+def test_fetch_resets_the_lock_file_every_run(tmp_path, monkeypatch):
+    checkout = tmp_path / "src"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "terraform").mkdir()
+    (checkout / "terraform" / "variables.tf").write_text("")
+    git = FakeGit(head=TERRAFORM_REF)
+    monkeypatch.setattr(tf_mod, "_git", git)
+    executor = make_executor(tmp_path, tf=Fake())
+    fetch = dataclasses.replace(step(executor, "tf-fetch-module"),
+                                args=["fetch-module", str(checkout)])
+    assert tf_mod.action_fetch_module(executor, fetch).ok
+    assert ("checkout", "--", "terraform/.terraform.lock.hcl") in git.calls
+
+
+def test_plan_command_reports_a_failed_terraform_plan(tmp_path, monkeypatch):
+    from aro_hcp import cli
+    ok = lambda ex, s: AzResult(s.render(ex.context), 0, "ok", "")  # noqa: E731
+    monkeypatch.setitem(tf_mod.ACTIONS, "fetch-module", ok)
+    monkeypatch.setitem(tf_mod.ACTIONS, "write-tfvars", ok)
+    tf = Fake([("plan", (1, "", "Error: Required plugins are not installed"))])
+    executor = make_executor(tmp_path, tf=tf, az=Fake(program="az"), apply=False)
+    assert cli._terraform_plan(executor, None) == cli.EXIT_FAILED

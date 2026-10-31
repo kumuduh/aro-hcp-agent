@@ -528,7 +528,12 @@ def _terraform_plan(executor: Executor, phases) -> int:
     outcomes = executor.run_all(wanted, stop_on_error=True)
     for outcome in outcomes:
         step = outcome.step
-        if outcome.status == state_mod.FAILED:
+        # A dry run reports a failed lookup as pending (the resource may just
+        # not exist yet), but the local terraform steps really run here: a
+        # failed init or plan is a failure, not something to wait for.
+        local_failure = (outcome.status == state_mod.PENDING and step.runner == "terraform"
+                         and not step.mutating)
+        if outcome.status == state_mod.FAILED or local_failure:
             print(f"\nFAILED {step.id}: {step.description}")
             print(f"  {outcome.command}")
             print(f"  {_failure_text(outcome)}")

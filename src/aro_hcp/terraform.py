@@ -400,6 +400,12 @@ def _resolve_ref(checkout: Path, ref: str) -> tuple[str | None, str]:
     return None, f"cannot resolve terraform_ref {ref!r} to a commit in {checkout}"
 
 
+#: The module's provider lock file. `terraform init` adds the current
+#: platform's hashes to it (the committed file covers linux only), so it is the
+#: one file allowed to differ; fetch-module resets it every run.
+_LOCK_FILE = "terraform/.terraform.lock.hcl"
+
+
 def _verify_existing_checkout(checkout: Path) -> str:
     """Return why a cached checkout cannot be trusted, or "" if it can.
 
@@ -416,8 +422,9 @@ def _verify_existing_checkout(checkout: Path) -> str:
     status = _git("status", "--porcelain", cwd=checkout)
     if status.returncode != 0:
         return f"git status failed in {checkout}: {status.stderr.strip()}"
-    if status.stdout.strip():
-        changed = ", ".join(line[3:] for line in status.stdout.splitlines()[:5])
+    dirty = [line for line in status.stdout.splitlines() if line[3:] != _LOCK_FILE]
+    if dirty:
+        changed = ", ".join(line[3:] for line in dirty[:5])
         return (f"{checkout} has local changes ({changed}); the pinned module "
                 "must be applied unmodified. Discard them or delete the checkout")
     return ""
@@ -460,6 +467,11 @@ def action_fetch_module(executor, step: Step) -> AzResult:
         problem = _verify_existing_checkout(checkout)
         if problem:
             return _fail(argv, problem)
+        # Back to the committed lock file, so a checkout of another commit
+        # cannot conflict with the hashes the last init added.
+        reset = _git("checkout", "--", _LOCK_FILE, cwd=checkout)
+        if reset.returncode != 0 and (checkout / _LOCK_FILE).exists():
+            return _fail(argv, f"could not reset {_LOCK_FILE}: {reset.stderr.strip()}")
         head = _git("rev-parse", "HEAD", cwd=checkout)
         previous = head.stdout.strip() if head.returncode == 0 else ""
         # Exact, full-length comparison: a prefix match accepts any commit
