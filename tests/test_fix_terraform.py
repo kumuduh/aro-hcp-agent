@@ -745,3 +745,12 @@ def test_teardown_tfvars_replace_an_invalid_node_pool_name():
     from aro_hcp.terraform import _node_pools
     config = make_config(skip_nodepool=True, nodepool_name="np_1")
     assert list(_node_pools(config, teardown=True)) == ["np-1"]
+
+
+def test_dry_run_does_not_claim_the_applies_wait_for_a_plan_that_ran(tmp_path):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, NO_DELETES, ""))])
+    executor = make_executor(tmp_path, tf=tf, az=Fake(program="az"), apply=False)
+    events = []
+    executor.on_event = events.append
+    executor.run_all(["plan", "apply"], stop_on_error=False)
+    assert not [e for e in events if "waits for tf-plan" in e]

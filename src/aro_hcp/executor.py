@@ -581,7 +581,9 @@ class Executor:
         by_id = self.steps_by_id()
         for dep_id in step.after:
             dep = by_id.get(dep_id)
-            if dep is not None and self._always(dep) and dep_id not in self._ran:
+            if dep_id in self._ran:
+                continue  # done in this invocation (a dry run records nothing)
+            if dep is not None and self._always(dep):
                 # A step that re-runs every time (terraform plan) only vouches
                 # for this invocation; an earlier run's record says nothing
                 # about what would happen now.
