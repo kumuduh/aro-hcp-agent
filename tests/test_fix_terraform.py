@@ -795,3 +795,33 @@ def test_plan_command_reports_a_failed_terraform_plan(tmp_path, monkeypatch):
     tf = Fake([("plan", (1, "", "Error: Required plugins are not installed"))])
     executor = make_executor(tmp_path, tf=tf, az=Fake(program="az"), apply=False)
     assert cli._terraform_plan(executor, None) == cli.EXIT_FAILED
+
+
+
+# -- found live: terraform state holding the pull secret was world-readable -------
+
+
+def test_terraform_runs_with_a_private_umask(monkeypatch, tmp_path):
+    from aro_hcp import runner as runner_mod
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda name: "/usr/bin/terraform")
+    runner_mod.TerraformCli(tmp_path).run(["version"], force=True)
+    assert seen.get("umask") == 0o077
+
+
+def test_existing_state_files_are_made_private(tmp_path):
+    config = make_config()
+    paths = tf_mod.layout(config, tmp_path)
+    for path in (paths.tfstate, paths.tfstate.with_name(paths.tfstate.name + ".backup")):
+        path.write_text("{}")
+        path.chmod(0o644)
+    executor = make_executor(tmp_path, config, tf=Fake())
+    tf_mod.action_write_tfvars(executor, step(executor, "tf-write-tfvars"))
+    assert oct(paths.tfstate.stat().st_mode & 0o777) == "0o600"
+    assert oct(paths.tfstate.with_name(paths.tfstate.name + ".backup").stat().st_mode & 0o777) == "0o600"

@@ -352,7 +352,9 @@ Key Vault as `redhat-pull-secret`.
   `api_visibility: Private`, run apply from a network that reaches the API.
 - The secret never appears in argv, logs or the aro-hcp state file, which keeps
   only its SHA-256: edit the file and re-run `apply` to rotate it. Terraform's
-  own state does hold the Key Vault secret, so keep `.aro-hcp/` private.
+  own state (and its `.backup`) does hold the Key Vault secret in plain text;
+  aro-hcp runs terraform with umask 077 so both are created `0600`, and
+  tightens older ones. Keep `.aro-hcp/` private and out of version control.
 - Teardown needs no file: the Secret goes with the cluster, and Terraform
   purges the vault.
 

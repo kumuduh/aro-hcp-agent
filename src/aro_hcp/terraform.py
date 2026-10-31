@@ -570,6 +570,11 @@ def action_write_tfvars(executor, step: Step) -> AzResult:
     """Render the config into the module's tfvars file."""
     argv = step.render(executor.context)
     target = Path(argv[1])
+    # State written before terraform ran under umask 077 keeps its old mode.
+    state = layout(executor.config, target.parent).tfstate
+    for path in (state, state.with_name(state.name + ".backup")):
+        if path.exists():
+            path.chmod(0o600)
     body = render_tfvars(executor.config, teardown="--teardown" in argv[2:])
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.read_text(encoding="utf-8") == body:

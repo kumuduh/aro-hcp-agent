@@ -188,6 +188,10 @@ class TerraformCli:
                 timeout=timeout,
                 check=False,
                 env=self.environ(),
+                # Terraform's state and its .backup hold every resource's
+                # attributes in plain text, Key Vault secret values included
+                # (the pull secret): create them private, like aro-hcp state.
+                **({"umask": 0o077} if os.name == "posix" else {}),
             )
         except subprocess.TimeoutExpired as exc:
             partial_err = _text(exc.stderr).strip()
