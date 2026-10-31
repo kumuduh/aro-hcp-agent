@@ -52,7 +52,7 @@ _SUBNET_NAME_RE = _NSG_NAME_RE  # 1-80, same character rules
 #: Node pool names become OpenShift machine pool IDs: a short lowercase DNS
 #: label (3-15 chars). Stricter than some Azure names, but a pool the service
 #: refuses after the cluster is up is a slower way to learn the same rule.
-_NODEPOOL_NAME_RE = re.compile(r"^[a-z][-a-z0-9]{1,13}[a-z0-9]$")
+NODEPOOL_NAME_RE = re.compile(r"^[a-z][-a-z0-9]{1,13}[a-z0-9]$")
 
 #: Channel groups the service is known to offer. Not enforced: a new group
 #: should not need a release of this tool, and preflight checks the real list.
@@ -81,7 +81,7 @@ _STR_FIELDS = (
     "vnet_address_prefix", "worker_subnet_prefix", "vnet_integration_subnet_prefix",
     "managed_resource_group", "channel_group", "api_visibility", "ingress_visibility",
     "keyvault_name", "kms_key_name", "vault_visibility", "nodepool_name",
-    "nodepool_vm_size", "backend", "terraform_dir", "terraform_ref",
+    "nodepool_vm_size", "backend", "terraform_dir", "terraform_ref", "pull_secret_path",
 )
 _BOOL_FIELDS = ("keyvault_private_endpoint", "skip_nodepool")
 _VERSION_FIELDS = ("cluster_version", "nodepool_version")
@@ -259,6 +259,9 @@ class ClusterConfig:
     # Behaviour
     skip_nodepool: bool = False
     tags: dict[str, str] = field(default_factory=dict)
+    #: A Red Hat pull secret (dockerconfigjson) to add to the cluster as
+    #: kube-system/additional-pull-secret. Empty: the cluster gets none.
+    pull_secret_path: str = ""
 
     # Backend selection
     backend: str = "az-cli"
@@ -285,6 +288,8 @@ class ClusterConfig:
         self.keyvault_name = self.keyvault_name or f"{self.cluster_name}-kv"[:24].rstrip("-")
         if self.keyvault_private_endpoint:
             self.vault_visibility = "Private"
+        if isinstance(self.pull_secret_path, str) and self.pull_secret_path:
+            self.pull_secret_path = os.path.expanduser(self.pull_secret_path)
 
     def with_overrides(self, **overrides) -> "ClusterConfig":
         """Return a copy with ``overrides`` applied and derived names re-derived.
@@ -330,8 +335,14 @@ class ClusterConfig:
 
     # -- validation ---------------------------------------------------------
 
-    def validate(self) -> list[str]:
-        """Return a list of problems; empty means the config is usable."""
+    def validate(self, *, teardown: bool = False) -> list[str]:
+        """Return a list of problems; empty means the config is usable.
+
+        ``teardown=True`` keeps only the checks that locate what to delete
+        (names, subscription, region, backend). The rest guard a build, and a
+        cluster built before one of them was added must still be deletable
+        without editing its config.
+        """
         problems = _type_problems({f.name: getattr(self, f.name) for f in fields(self)})
         if problems:
             # Every check below assumes the types are right.
@@ -366,6 +377,11 @@ class ClusterConfig:
             )
         if not self.location or not self.location.islower() or " " in self.location:
             problems.append(f"location {self.location!r}: use a short region name, e.g. 'eastus'")
+        problems.extend(self._validate_names(teardown=teardown))
+        problems.extend(self._validate_backend(teardown=teardown))
+        if teardown:
+            return problems
+
         if not _CLUSTER_VERSION_RE.match(self.cluster_version):
             problems.append(
                 f"cluster_version {self.cluster_version!r}: must be major.minor, e.g. '4.22'"
@@ -397,13 +413,17 @@ class ClusterConfig:
             )
         if self.nodepool_replicas < 1:
             problems.append(f"nodepool_replicas {self.nodepool_replicas}: must be >= 1")
+        if self.pull_secret_path:
+            from .pullsecret import PullSecretError, read  # local: pullsecret imports plan
 
-        problems.extend(self._validate_names())
-        problems.extend(self._validate_backend())
+            try:
+                read(self.pull_secret_path)
+            except PullSecretError as exc:
+                problems.append(str(exc))
         problems.extend(self._validate_network())
         return problems
 
-    def _validate_names(self) -> list[str]:
+    def _validate_names(self, *, teardown: bool = False) -> list[str]:
         """Azure naming rules for the names the plan passes to `az` verbatim."""
         problems: list[str] = []
         for label, regex, rule in (
@@ -424,18 +444,21 @@ class ClusterConfig:
                 f"worker_subnet_name and vnet_integration_subnet_name are both "
                 f"{self.worker_subnet_name!r}; they are two subnets and need two names"
             )
-        if not _NODEPOOL_NAME_RE.match(self.nodepool_name):
+        # No teardown step names the node pool: deleting the cluster cascades it.
+        if not teardown and not NODEPOOL_NAME_RE.match(self.nodepool_name):
             problems.append(
                 f"nodepool_name {self.nodepool_name!r}: must be 3-15 chars, lowercase "
                 "letters, digits or '-', starting with a letter and not ending in '-'"
             )
         return problems
 
-    def _validate_backend(self) -> list[str]:
+    def _validate_backend(self, *, teardown: bool = False) -> list[str]:
         problems: list[str] = []
         if self.backend not in BACKENDS:
             problems.append(f"backend {self.backend!r}: must be one of {BACKENDS}")
             return problems
+        if teardown:
+            return self._validate_terraform_dir()
         if self.backend != "terraform":
             if self.vault_visibility == "Private" and not self.keyvault_private_endpoint:
                 problems.append(
@@ -468,7 +491,12 @@ class ClusterConfig:
                 f"nodepool_replicas {self.nodepool_replicas}: the terraform backend "
                 "requires >= 2 (the pinned module rejects fewer)"
             )
-        if self.terraform_dir:
+        problems.extend(self._validate_terraform_dir())
+        return problems
+
+    def _validate_terraform_dir(self) -> list[str]:
+        problems: list[str] = []
+        if self.backend == "terraform" and self.terraform_dir:
             root = Path(self.terraform_dir)
             if not root.is_dir():
                 problems.append(f"terraform_dir {self.terraform_dir!r}: not a directory")
@@ -536,8 +564,8 @@ class ClusterConfig:
                 )
         return problems
 
-    def require_valid(self) -> None:
-        problems = self.validate()
+    def require_valid(self, *, teardown: bool = False) -> None:
+        problems = self.validate(teardown=teardown)
         if problems:
             raise ConfigError(
                 "invalid cluster configuration:\n"
@@ -611,6 +639,10 @@ class ClusterConfig:
             data = {}
         if not isinstance(data, dict):
             raise ConfigError(f"{path}: expected a mapping at the top level")
+        secret = data.get("pull_secret_path")
+        if isinstance(secret, str) and secret and not Path(secret).expanduser().is_absolute():
+            # Relative to the config file, so the file works from any directory.
+            data["pull_secret_path"] = str((path.parent / secret).resolve())
         try:
             return cls.from_dict(data)
         except ConfigError as exc:

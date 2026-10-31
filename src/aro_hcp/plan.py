@@ -24,6 +24,7 @@ PHASES = (
     "etcd-encryption",
     "cluster",
     "nodepool",
+    "pull-secret",
 )
 
 
@@ -161,7 +162,7 @@ def _role_assignment_step(
         ],
         exists=[
             "role", "assignment", "list",
-            "--assignee", f"${{{principal_var}}}",
+            "--assignee-object-id", f"${{{principal_var}}}",
             "--role", role,
             "--scope", f"${{{scope_var}}}",
             "--query", "[0].id", "--output", "tsv",
@@ -341,13 +342,17 @@ def build_plan(config: ClusterConfig) -> list[Step]:
         Step(
             id="keyvault-crypto-officer",
             phase="etcd-encryption",
-            description="Grant the signed-in user Key Vault Crypto Officer",
+            description="Grant the signed-in principal Key Vault Crypto Officer",
+            # By object id and type, which needs no Graph lookup: a managed
+            # identity login usually has no Graph read permission.
             args=["role", "assignment", "create", "--role", "Key Vault Crypto Officer",
-                  "--assignee", "${SIGNED_IN_USER}", "--scope", "${KEYVAULT_ID}"],
-            exists=["role", "assignment", "list", "--assignee", "${SIGNED_IN_USER}",
+                  "--assignee-object-id", "${SIGNED_IN_USER}",
+                  "--assignee-principal-type", "${SIGNED_IN_PRINCIPAL_TYPE}",
+                  "--scope", "${KEYVAULT_ID}"],
+            exists=["role", "assignment", "list", "--assignee-object-id", "${SIGNED_IN_USER}",
                     "--role", "Key Vault Crypto Officer", "--scope", "${KEYVAULT_ID}",
                     "--query", "[0].id", "--output", "tsv"],
-            requires=("SIGNED_IN_USER", "KEYVAULT_ID"),
+            requires=("SIGNED_IN_USER", "SIGNED_IN_PRINCIPAL_TYPE", "KEYVAULT_ID"),
             tags=("role-assignment",),
         ),
         Step(
@@ -541,5 +546,13 @@ def build_plan(config: ClusterConfig) -> list[Step]:
                 mutating=False,
             ),
         ]
+
+    # -- pull secret ----------------------------------------------------------
+    if config.pull_secret_path:
+        from .pullsecret import build_step  # local: pullsecret imports Step
+
+        after = ("cluster-create",) if config.skip_nodepool else ("cluster-create",
+                                                                 "nodepool-create")
+        steps.append(build_step(config, after=after))
 
     return steps

@@ -21,7 +21,7 @@ WARN = "warn"
 FAIL = "fail"
 
 #: `az account show --query user.name` under `az login --identity`. These are
-#: literals, not principals, so nothing can be granted to them by that name.
+#: literals, not principals: the identity's object id comes from its token.
 MANAGED_IDENTITY_USER_NAMES = {"systemAssignedIdentity", "userAssignedIdentity"}
 
 #: Built-in roles that carry Microsoft.Authorization/roleAssignments/write. The
@@ -129,6 +129,30 @@ def check_az_cli(az: AzCli) -> Finding:
     return Finding("az-cli", OK, f"azure-cli {'.'.join(str(p) for p in version)}")
 
 
+def check_pull_secret(config: ClusterConfig) -> list[Finding]:
+    """Tooling the pull-secret step needs; it runs last, after everything is built."""
+    from .pullsecret import kube_client
+
+    client = kube_client()
+    if client is None:
+        return [Finding(
+            "pull-secret", FAIL,
+            "pull_secret_path is set, but neither `oc` nor `kubectl` is on PATH; the "
+            "last step would fail after the cluster is built",
+            "install oc: https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/",
+        )]
+    findings = [Finding("pull-secret", OK, f"will add the pull secret with {client}")]
+    if config.api_visibility == "Private":
+        findings.append(Finding(
+            "pull-secret", WARN,
+            "api_visibility is Private: the pull-secret step talks to the cluster API, "
+            "so apply must run from a network that can reach it",
+            "run apply from a host in (or peered with) the VNet, or add the secret later "
+            "with `aro-hcp apply --phase pull-secret`",
+        ))
+    return findings
+
+
 def check_terraform(config: ClusterConfig) -> list[Finding]:
     """Tooling the terraform backend needs and the az one does not."""
     from .runner import MIN_TERRAFORM_VERSION
@@ -216,16 +240,23 @@ def check_login(az: AzCli, config: ClusterConfig) -> list[Finding]:
         )
     user = az.signed_in_user()
     if user in MANAGED_IDENTITY_USER_NAMES:
-        findings.append(
-            Finding(
-                "identity", FAIL,
-                f"signed in with a managed identity (user.name is the literal {user!r}); "
-                "the Key Vault Crypto Officer grant would use that literal as its "
-                "assignee and fail mid-apply",
-                "sign in as a user (az login) or a service principal "
-                "(az login --service-principal -u <appId> ...)",
+        kind = "system" if user == "systemAssignedIdentity" else "user"
+        oid = az.principal_object_id()
+        if oid:
+            findings.append(
+                Finding("identity", OK,
+                        f"signed in with a {kind}-assigned managed identity, object id {oid}")
             )
-        )
+        else:
+            findings.append(
+                Finding(
+                    "identity", FAIL,
+                    f"signed in with a {kind}-assigned managed identity, but its object "
+                    "id could not be read from its access token; the Key Vault Crypto "
+                    "Officer grant needs it",
+                    "az account get-access-token --query accessToken --output tsv",
+                )
+            )
     elif user:
         findings.append(Finding("identity", OK, f"signed in as {user}"))
     else:
@@ -433,22 +464,30 @@ def check_vm_sku(az: AzCli, config: ClusterConfig) -> Finding:
     return Finding("vm-size", OK, f"{size} is offered in {config.location}")
 
 
-def _resolve_principal(az: AzCli) -> tuple[str, str]:
-    """Return (assignee, kind) for the signed-in principal.
+def principal_type(kind: str) -> str:
+    """The ``--assignee-principal-type`` for a kind from ``_resolve_principal``."""
+    return "User" if kind == "user" else "ServicePrincipal"
 
-    The object id is preferred; when Graph cannot be read the login name (UPN
-    or appId) still works as ``--assignee``. ``assignee`` is empty for a
-    managed-identity login, whose name is not a principal.
+
+def _resolve_principal(az: AzCli) -> tuple[str, str]:
+    """Return (object id, kind) for the signed-in principal.
+
+    ``kind`` is "user", "servicePrincipal" or "managedIdentity". The object id
+    is read from the access token, which needs no Graph permission; the Graph
+    lookups are a fallback for users and service principals. It is empty when
+    nothing resolves, so a grant fails up front as unresolved rather than
+    being made to a login name.
     """
     name = az.signed_in_user() or ""
     if name in MANAGED_IDENTITY_USER_NAMES:
-        return "", "managedIdentity"
-    kind = az.query(["account", "show", "--query", "user.type", "--output", "tsv"])
-    if kind == "servicePrincipal" and name:
+        return az.principal_object_id() or "", "managedIdentity"
+    kind = az.query(["account", "show", "--query", "user.type", "--output", "tsv"]) or "user"
+    oid = az.principal_object_id()
+    if not oid and kind == "servicePrincipal" and name:
         oid = az.query(["ad", "sp", "show", "--id", name, "--query", "id", "--output", "tsv"])
-    else:
+    elif not oid:
         oid = az.query(["ad", "signed-in-user", "show", "--query", "id", "--output", "tsv"])
-    return (oid or name), (kind or "user")
+    return oid or "", kind
 
 
 def _scope_covers(scope: str, target: str) -> bool:
@@ -506,8 +545,9 @@ def check_role_assignment_permission(az: AzCli, config: ClusterConfig) -> Findin
     if not assignee:
         return Finding(
             "permissions", WARN,
-            "cannot check role-assignment rights for a managed-identity login",
-            "sign in as a user or service principal and re-run preflight",
+            "could not resolve the signed-in principal's object id, so its "
+            "role-assignment rights cannot be checked",
+            "az account get-access-token --query accessToken --output tsv",
         )
     remedy = (
         "have an Owner grant it: az role assignment create --assignee "
@@ -520,7 +560,9 @@ def check_role_assignment_permission(az: AzCli, config: ClusterConfig) -> Findin
     errors = []
     for scope in (sub_scope, rg_scope):
         result = az.run(
-            ["role", "assignment", "list", "--assignee", assignee,
+            # --assignee-object-id: --assignee would first look the id up in
+            # Graph, which a managed identity usually cannot read.
+            ["role", "assignment", "list", "--assignee-object-id", assignee,
              "--include-inherited", "--include-groups", "--scope", scope, "--output", "json"],
             check=False, force=True,
         )
@@ -556,7 +598,7 @@ def check_role_assignment_permission(az: AzCli, config: ClusterConfig) -> Findin
             "permissions", WARN,
             f"could not read the role assignments of {assignee}, so it is unknown "
             f"whether it can create role assignments ({'; '.join(errors)})",
-            f"az role assignment list --assignee {assignee} --all --include-inherited "
+            f"az role assignment list --assignee-object-id {assignee} --all --include-inherited "
             "--include-groups -o table; it needs Owner, User Access Administrator or "
             "Role Based Access Control Administrator on the resource group",
         )
@@ -1037,6 +1079,8 @@ def run_preflight(az: AzCli, config: ClusterConfig, *, deep: bool = True) -> Pre
     report.add(check_aro_extension(az))
     if config.backend == "terraform":
         report.add(*check_terraform(config))
+    if config.pull_secret_path:
+        report.add(*check_pull_secret(config))
 
     if not deep:
         return report

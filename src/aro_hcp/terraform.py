@@ -24,13 +24,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import roles
+from . import pullsecret, roles
 from .azure import DEFAULT_TIMEOUT, LONG_TIMEOUT, AzResult
-from .config import TERRAFORM_REF, TERRAFORM_REPO, ClusterConfig
+from .config import NODEPOOL_NAME_RE, TERRAFORM_REF, TERRAFORM_REPO, ClusterConfig
 from .plan import Step, _role_assignment_step
 from .runner import TerraformCli
 
-TERRAFORM_PHASES = ("workspace", "init", "plan", "apply", "outputs")
+TERRAFORM_PHASES = ("workspace", "init", "plan", "apply", "outputs", "pull-secret")
 
 TERRAFORM_DESTROY_PHASES = ("workspace", "init", "nodepool-state", "destroy")
 
@@ -54,6 +54,9 @@ BOOKKEEPING = "bookkeeping"
 #: action (and the tfvars/module actions, when their inputs changed) clears
 #: their recorded completion, so a finished apply does not hide a new diff.
 RERUN_ON_CHANGES = "rerun-on-changes"
+
+#: State context key for the module commit a cluster was built from.
+MODULE_COMMIT = "TF_MODULE_COMMIT"
 
 #: Steps that exist only because of the D31 upstream gap; see below.
 D31_TAG = "d31-workaround"
@@ -107,7 +110,6 @@ _PINNED_DEFAULTS = {
         "az-cli backend never asks for directory permissions",
     ),
     "enable_jumpbox": (False, "out of scope for this tool"),
-    "pull_secret_path": ("", "no pull secret is managed here"),
 }
 
 
@@ -223,7 +225,18 @@ def _hcl(value) -> str:
     raise TypeError(f"cannot render {type(value).__name__} as HCL")
 
 
-def _node_pools(config: ClusterConfig) -> dict:
+def _node_pools(config: ClusterConfig, *, teardown: bool = False) -> dict:
+    if teardown:
+        # The module requires one pool of >= 2 replicas even to destroy, and
+        # the teardown drops every pool from state first (OCPBUGS-86702), so
+        # these values only have to pass its validation.
+        name = config.nodepool_name if NODEPOOL_NAME_RE.match(config.nodepool_name) else "np-1"
+        return {
+            name: {
+                "vm_size": config.nodepool_vm_size,
+                "replicas": max(2, config.nodepool_replicas),
+            }
+        }
     if config.skip_nodepool:
         return {}
     return {
@@ -245,7 +258,7 @@ def _provenance(config: ClusterConfig) -> str:
     return f"# Module: {TERRAFORM_REPO} @ {config.terraform_ref}"
 
 
-def render_tfvars(config: ClusterConfig) -> str:
+def render_tfvars(config: ClusterConfig, *, teardown: bool = False) -> str:
     """Translate the cluster config into the upstream module's variables.
 
     Every name on the right is a variable in the module's variables.tf; where
@@ -272,7 +285,11 @@ def render_tfvars(config: ClusterConfig) -> str:
         ("ingress_visibility", config.ingress_visibility),
         ("vault_visibility", config.vault_visibility),
         ("tags", dict(config.tags)),
-        ("node_pools", _node_pools(config)),
+        ("node_pools", _node_pools(config, teardown=teardown)),
+        # The module stores the file in Key Vault as redhat-pull-secret; the
+        # pull-secret step puts it in the cluster. A teardown must not depend
+        # on the file still being there (the module checks it exists).
+        ("pull_secret_path", "" if teardown else config.pull_secret_path),
     ]
 
     lines = [
@@ -291,7 +308,9 @@ def render_tfvars(config: ClusterConfig) -> str:
     for name, (value, why) in _PINNED_DEFAULTS.items():
         lines.append(f"# {why}")
         lines.append(f"{name.ljust(width)} = {_hcl(value)}")
-    if config.skip_nodepool:
+    if teardown and (config.skip_nodepool or config.nodepool_replicas < 2):
+        lines.insert(4, "# Written for a teardown: node_pools only satisfies the module.")
+    elif config.skip_nodepool:
         lines.insert(4, "# skip_nodepool is set: node_pools is empty.")
     return "\n".join(lines) + "\n"
 
@@ -429,6 +448,13 @@ def action_fetch_module(executor, step: Step) -> AzResult:
         return _fail(argv, "`git` is not on PATH; it is needed to fetch the module")
 
     ref = config.terraform_ref
+    recorded = executor.state.get(MODULE_COMMIT)
+    if "--teardown" in argv[2:] and recorded and recorded != ref:
+        # Tear down with the module the cluster was built from, wherever
+        # terraform_ref points today (a moved branch, a newer default pin).
+        executor.on_event(f"note  {step.id}: using module commit {recorded[:12]}, "
+                          "recorded when the cluster was built")
+        ref = recorded
     previous = ""
     if (checkout / ".git").is_dir():
         problem = _verify_existing_checkout(checkout)
@@ -439,6 +465,14 @@ def action_fetch_module(executor, step: Step) -> AzResult:
         # Exact, full-length comparison: a prefix match accepts any commit
         # sharing the first seven characters (TF-2).
         if _FULL_SHA.match(ref) and previous == ref:
+            # Still checked: a gitignored *.auto.tfvars passes `git status`
+            # and would override the generated variables (D30).
+            foreign = _foreign_var_files(module)
+            if foreign:
+                return _fail(argv, _foreign_message(module, foreign))
+            moved = _record_module_commit(executor, ref, ref)
+            if moved:
+                return _fail(argv, moved)
             return _ok(argv, f"{checkout} is already at {ref[:12]}")
         fetched = _git("fetch", "--quiet", "origin", cwd=checkout)
         if fetched.returncode != 0:
@@ -480,6 +514,9 @@ def action_fetch_module(executor, step: Step) -> AzResult:
     foreign = _foreign_var_files(module)
     if foreign:
         return _fail(argv, _foreign_message(module, foreign))
+    moved = _record_module_commit(executor, ref, sha)
+    if moved:
+        return _fail(argv, moved)
     # A different commit is a different module: what was applied before
     # no longer describes what this one would build. (A fresh clone has no
     # "before"; the plan step catches any difference that matters.)
@@ -487,6 +524,26 @@ def action_fetch_module(executor, step: Step) -> AzResult:
         _rerun_on_changes(executor, f"module moved from {previous[:12]} to {sha[:12]}")
     resolved = "" if sha == ref else f" ({ref} resolves to {sha})"
     return _ok(argv, f"checked out {sha[:12]} in {checkout}{resolved}")
+
+
+def _record_module_commit(executor, ref: str, sha: str) -> str:
+    """Record the module commit in state; say why not if a name moved under it.
+
+    A branch or tag is resolved afresh on every run, so the same config could
+    build or update one cluster with different module code. A full SHA in
+    terraform_ref is a deliberate choice and is simply recorded. (A teardown
+    never gets here with a moved name: it checks out the recorded commit.)
+    """
+    recorded = executor.state.get(MODULE_COMMIT)
+    if recorded and recorded != sha and not _FULL_SHA.match(ref):
+        return (
+            f"terraform_ref {ref!r} now resolves to {sha[:12]}, but this cluster's "
+            f"state records module commit {recorded[:12]}: it moved upstream. Set "
+            f"terraform_ref: {recorded} to keep the module the cluster was built "
+            f"with, or terraform_ref: {sha} to move to the new one deliberately"
+        )
+    executor.state.set_context(MODULE_COMMIT, sha)
+    return ""
 
 
 def _foreign_message(module: Path, names: list[str]) -> str:
@@ -501,7 +558,7 @@ def action_write_tfvars(executor, step: Step) -> AzResult:
     """Render the config into the module's tfvars file."""
     argv = step.render(executor.context)
     target = Path(argv[1])
-    body = render_tfvars(executor.config)
+    body = render_tfvars(executor.config, teardown="--teardown" in argv[2:])
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.read_text(encoding="utf-8") == body:
         return _ok(argv, f"{target} is already up to date")
@@ -512,23 +569,66 @@ def action_write_tfvars(executor, step: Step) -> AzResult:
     return _ok(argv, f"wrote {target} ({len(body.splitlines())} lines)")
 
 
+def _planned_deletes(runner, plan_file: Path, timeout: int) -> tuple[list[str] | None, str]:
+    """Addresses the saved plan deletes or replaces, or ``(None, error)``."""
+    shown = runner.run(["show", "-json", str(plan_file)], check=False, force=True,
+                       timeout=timeout)
+    try:
+        payload = json.loads(shown.stdout) if shown.ok else None
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        return None, (shown.stderr.strip() or "unreadable `terraform show -json` output")
+    return [
+        str(change.get("address"))
+        for change in payload.get("resource_changes") or []
+        if isinstance(change, dict)
+        and "delete" in ((change.get("change") or {}).get("actions") or [])
+    ], ""
+
+
 def action_terraform_plan(executor, step: Step) -> AzResult:
     """Run `terraform plan -detailed-exitcode` and act on its answer.
 
     Exit 2 means "succeeded, with changes". The executor would read that as a
     failure, so this maps it to success and marks the apply steps pending:
     a completed apply must not hide a diff the plan just reported (D16).
+
+    Apply re-plans with -auto-approve rather than applying a saved plan, so
+    nobody reviews what it runs. A diff that deletes or replaces anything
+    (drift, a moved module ref) is therefore refused unless the operator
+    passed --allow-deletes. The saved plan is only inspected, then removed:
+    it holds variable values, the pull secret among them.
     """
     runner = executor.runner_for(step)
     argv = step.render(executor.context)
-    result = runner.run(argv, check=False, force=True, timeout=step.timeout)
-    if result.returncode == 2:
-        executor.state.set_context("TF_PLAN_HAS_CHANGES", "yes")
-        _rerun_on_changes(executor, "terraform plan reports changes")
-        return AzResult(result.args, 0, result.stdout, result.stderr)
-    if result.ok:
-        executor.state.set_context("TF_PLAN_HAS_CHANGES", "no")
-    return result
+    plan_file = Path(next(a for a in argv if a.startswith("-out=")).split("=", 1)[1])
+    plan_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = runner.run(argv, check=False, force=True, timeout=step.timeout)
+        if result.returncode != 2:
+            if result.ok:
+                executor.state.set_context("TF_PLAN_HAS_CHANGES", "no")
+            return result
+        deletes, error = _planned_deletes(runner, plan_file, step.timeout)
+    finally:
+        plan_file.unlink(missing_ok=True)
+    executor.state.set_context("TF_PLAN_HAS_CHANGES", "yes")
+    _rerun_on_changes(executor, "terraform plan reports changes")
+    passed = AzResult(result.args, 0, result.stdout, result.stderr)
+    if not deletes and deletes is not None:
+        return passed
+    what = (f"would delete or replace {len(deletes)} resource(s): {', '.join(deletes[:10])}"
+            if deletes else f"could not be checked for deletions ({error})")
+    if not executor.apply or executor.allow_deletes:
+        executor.on_event(f"warn  {step.id}: the plan {what}")
+        return passed
+    return _fail(
+        argv,
+        f"terraform plan {what}. Apply re-plans without a review, so this is refused. "
+        "Inspect it with `aro-hcp plan --backend terraform -v`, then re-run apply "
+        "with --allow-deletes if it is intended.",
+    )
 
 
 def action_state_rm_node_pools(executor, step: Step) -> AzResult:
@@ -622,7 +722,9 @@ def error_excerpt(text: str, limit: int = 4000) -> str:
 # -- plans ------------------------------------------------------------------
 
 
-def _workspace_steps(paths: Layout, *, always: bool = True) -> list[Step]:
+def _workspace_steps(
+    paths: Layout, *, always: bool = True, teardown: bool = False
+) -> list[Step]:
     """Fetch the module and write the tfvars.
 
     Both are marked non-mutating: they touch only the local work directory, so
@@ -635,7 +737,7 @@ def _workspace_steps(paths: Layout, *, always: bool = True) -> list[Step]:
             id="tf-fetch-module",
             phase="workspace",
             description="Fetch the upstream Terraform module at the pinned ref",
-            args=["fetch-module", str(paths.checkout)],
+            args=["fetch-module", str(paths.checkout), *(["--teardown"] if teardown else [])],
             action="fetch-module",
             runner="terraform",
             mutating=False,
@@ -646,7 +748,7 @@ def _workspace_steps(paths: Layout, *, always: bool = True) -> list[Step]:
             id="tf-write-tfvars",
             phase="workspace",
             description="Write the cluster config as Terraform variables",
-            args=["write-tfvars", str(paths.tfvars)],
+            args=["write-tfvars", str(paths.tfvars), *(["--teardown"] if teardown else [])],
             action="write-tfvars",
             runner="terraform",
             mutating=False,
@@ -697,6 +799,8 @@ def _d31_steps(var_file: str) -> list[Step]:
             runner="terraform",
             timeout=LONG_TIMEOUT,
             tags=tags,
+            # Only after this run's plan passed the deletion guard.
+            after=("tf-plan",),
         ),
         Step(
             id="tf-d31-vnet-id",
@@ -752,8 +856,10 @@ def build_terraform_plan(
             phase="plan",
             description="Show what Terraform would change",
             # -detailed-exitcode: exit 2 means "changes pending", which the
-            # action turns into "re-run the apply steps".
-            args=["plan", "-input=false", "-detailed-exitcode", var_file],
+            # action turns into "re-run the apply steps". -out is inspected
+            # for deletions, never applied.
+            args=["plan", "-input=false", "-detailed-exitcode",
+                  f"-out={paths.data_dir / 'aro-hcp-check.tfplan'}", var_file],
             action="terraform-plan",
             runner="terraform",
             mutating=False,
@@ -774,6 +880,9 @@ def build_terraform_plan(
             runner="terraform",
             timeout=LONG_TIMEOUT,
             tags=("billable", RERUN_ON_CHANGES),
+            # Only after this run's plan passed the deletion guard, so neither
+            # --keep-going nor --phase apply can skip it.
+            after=("tf-plan",),
         )
     )
     for name, var in (
@@ -794,6 +903,8 @@ def build_terraform_plan(
                 tags=(ALWAYS,),
             )
         )
+    if config.pull_secret_path:
+        steps.append(pullsecret.build_step(config, after=("tf-apply",)))
     return steps
 
 
@@ -812,7 +923,7 @@ def build_terraform_destroy_plan(
     """
     paths = layout(config, directory)
 
-    steps = _workspace_steps(paths)
+    steps = _workspace_steps(paths, teardown=True)
     steps.append(_init_step(paths, always=False))
     steps.append(
         Step(

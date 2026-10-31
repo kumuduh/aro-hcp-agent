@@ -97,3 +97,12 @@ nodepool_vm_size: Standard_D8s_v6
 
 # Create the cluster only, and add node pools yourself later.
 skip_nodepool: false
+
+# -- pull secret --------------------------------------------------------------
+# A Red Hat pull secret from console.redhat.com/openshift/install/pull-secret,
+# so the cluster can pull Red Hat images and OperatorHub content. Both backends
+# add it as kube-system/additional-pull-secret (needs `oc` or `kubectl`); the
+# terraform backend also stores it in the Key Vault as redhat-pull-secret.
+# Relative paths are relative to this file. Never commit the file.
+
+# pull_secret_path: ./pull-secret.json

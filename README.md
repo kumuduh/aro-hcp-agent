@@ -121,11 +121,11 @@ than vendored here, because the upstream repository ships no LICENSE file. Set
 `terraform_dir:` to use your own checkout instead. Each cluster gets its own
 `TF_DATA_DIR` and state file, so one checkout can back several.
 
-Three upstream defaults are pinned in the generated tfvars to keep the two
+Two upstream defaults are pinned in the generated tfvars to keep the two
 backends comparable: `enable_external_auth = false` (upstream defaults *true*
-and registers an Entra application, which the az path never does),
-`enable_jumpbox = false`, and `pull_secret_path = ""`. The generated file says
-so inline.
+and registers an Entra application, which the az path never does) and
+`enable_jumpbox = false`. The generated file says so inline. `pull_secret_path`
+follows the config key of the same name (see [Pull secret](#pull-secret)).
 
 **Missing role assignments in the pinned module (D31).** At the pinned ref the
 module grants `dp-file-csi-driver` its File Storage Operator role on the worker
@@ -142,6 +142,25 @@ not passed through, and a module directory containing `*.auto.tfvars` or
 `terraform.tfvars` is refused, so nothing outside `cluster.yaml` can change what
 is applied. The checkout must be exactly the pinned commit and clean.
 
+**Apply re-plans, so it refuses deletions.** `apply` runs a fresh `terraform
+plan` and then `terraform apply -auto-approve`, rather than applying a saved
+plan: the D31 two-stage apply and resumed runs would make a saved plan stale.
+The cost is that nobody reviews what the apply runs, so if the fresh plan
+deletes or replaces anything (drift, a moved module), apply stops and lists the
+resources. Review them with `aro-hcp plan --backend terraform -v`, then re-run
+with `--allow-deletes` if they are intended. `--confirm-each-phase` also gives a
+pause between the printed plan and the apply. Both apply steps require the
+plan to have passed in the same run, so neither `--keep-going` nor
+`--phase apply` on its own can skip the check (use `--phase plan --phase apply`).
+
+**`terraform_ref` and moving refs.** The default is a full commit SHA. A branch
+or tag also works, and is resolved afresh on every run, so state records the
+commit a cluster was built from. If the branch or tag later resolves to another
+commit, `apply` refuses and names both commits: pin `terraform_ref` to the
+recorded one to keep the module the cluster was built with, or to the new SHA
+to move deliberately. `destroy` always checks out the recorded commit, so a
+moved branch or a newer default pin never changes what tears a cluster down.
+
 **Tags enforced by Azure Policy.** Because every `plan` and `apply` runs a fresh
 `terraform plan`, tags that a subscription policy adds or inherits (`owner`,
 `cost-center`, …) show up as drift, and an apply would strip them on every run.
@@ -156,7 +175,7 @@ fails. ARM cascades the pools when the cluster goes.
 ## Phases
 
 With the `terraform` backend: `workspace` → `init` → `plan` → `apply` →
-`outputs`, and for teardown `workspace` → `init` → `nodepool-state` →
+`outputs` → `pull-secret`, and for teardown `workspace` → `init` → `nodepool-state` →
 `destroy`. With the default `az-cli` backend:
 
 | Phase | What it creates |
@@ -169,6 +188,7 @@ With the `terraform` backend: `workspace` → `init` → `plan` → `apply` →
 | `etcd-encryption` | Key Vault (RBAC), RSA-2048 KMS key, Crypto Officer/User grants (the other 2 of the 29), optional private endpoint |
 | `cluster` | `az aro hcp cluster create` — 15–20 minutes, billable |
 | `nodepool` | `az aro hcp cluster nodepool create` |
+| `pull-secret` | Only with `pull_secret_path`: `kube-system/additional-pull-secret` in the cluster |
 
 Run one phase at a time with `--phase network`.
 
@@ -223,8 +243,10 @@ the vault name reserved, so skipping it makes recreating the same cluster fail.
 Catches the failures that otherwise surface late:
 
 - az CLI version and the `aro` extension's `hcp` command group
-- Azure sign-in and the signed-in principal (needed for the Crypto Officer
-  grant); a managed-identity login is rejected because it cannot be an assignee
+- Azure sign-in and the signed-in principal's object id (needed for the
+  Crypto Officer grant). Users, service principals and managed identities
+  (`az login --identity`) all work; the object id is read from the access
+  token, so no Microsoft Graph permission is needed
 - **rights to create role assignments** (Owner, User Access Administrator, or
   Role Based Access Control Administrator) — otherwise apply would create the
   network and 13 identities and then fail
@@ -264,6 +286,7 @@ Notable optional keys:
 | `api_visibility` / `ingress_visibility` | `Public` | `Public` or `Private` |
 | `nodepool_replicas` / `nodepool_vm_size` | `2` / `Standard_D8s_v6` | |
 | `skip_nodepool` | `false` | Cluster only |
+| `pull_secret_path` | *(none)* | A Red Hat pull secret; see [Pull secret](#pull-secret) |
 
 The Key Vault name, the KMS key name, and the private endpoint are **not**
 config keys. The first two are derived, and Terraform names the vault itself;
@@ -289,6 +312,9 @@ Validation is strict and offline:
   setting on a public vault made the cluster create hang.
 - On the terraform backend, `skip_nodepool` and `nodepool_replicas < 2` are
   rejected: the pinned module would otherwise plan a cluster with no workers.
+- These rules guard a **build**. `destroy` checks only what locates the
+  resources (names, subscription, region, backend), so a cluster built before
+  a rule existed can always be torn down without editing its config.
 
 A malformed or unreadable config file is a clean error naming the file. `.json`
 files are read as JSON, everything else as YAML.
@@ -301,14 +327,41 @@ an error.
 explicitly — the vault, VNet, NSG and managed resource group follow the new
 cluster name.
 
+### Pull secret
+
+ARO HCP clusters are created with only the service's own registry
+credentials, so images from `registry.redhat.io` (OperatorHub, the sample
+image streams) cannot be pulled. Download your pull secret from
+[console.redhat.com](https://console.redhat.com/openshift/install/pull-secret)
+and point the config at it:
+
+```yaml
+pull_secret_path: ./pull-secret.json   # relative to this file; never commit it
+```
+
+Neither `az aro hcp cluster create` nor the cluster API accepts a pull secret.
+HyperShift merges a `kube-system/additional-pull-secret` Secret in the cluster
+into every node's credentials, so both backends add one as their last
+(`pull-secret`) phase: a 24-hour admin credential from `az aro hcp cluster
+request-credential --admin` is written to a private temporary file, the Secret
+is piped to `oc apply` (or `kubectl`) on stdin, and the file is removed. The
+terraform backend also passes the path to the module, which stores it in the
+Key Vault as `redhat-pull-secret`.
+
+- Needs `oc` or `kubectl` on PATH; preflight fails without one. With
+  `api_visibility: Private`, run apply from a network that reaches the API.
+- The secret never appears in argv, logs or the aro-hcp state file, which keeps
+  only its SHA-256: edit the file and re-run `apply` to rotate it. Terraform's
+  own state does hold the Key Vault secret, so keep `.aro-hcp/` private.
+- Teardown needs no file: the Secret goes with the cluster, and Terraform
+  purges the vault.
+
 ### What the cluster does not include
 
-A cluster built by either backend has **no Red Hat pull secret** (images from
-`registry.redhat.io`, including the sample image streams, cannot be pulled) and
-**no identity provider** (the web console reports
-`OAuthClientSecretGetDegraded`). Use `az aro hcp cluster request-credential
---admin` for break-glass access, and configure a pull secret and external
-authentication separately.
+A cluster has **no identity provider** (the web console reports
+`OAuthClientSecretGetDegraded`), and no Red Hat pull secret unless you set
+`pull_secret_path`. Use `az aro hcp cluster request-credential --admin` for
+break-glass access, and configure external authentication separately.
 
 ## Agent mode
 

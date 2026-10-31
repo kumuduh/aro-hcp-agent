@@ -232,6 +232,7 @@ _PHASE_NOTES = {
         "etcd-encryption": "Key Vault, RSA-2048 KMS key, Crypto Officer/User grants",
         "cluster": "az aro hcp cluster create (15-20 minutes)",
         "nodepool": "az aro hcp cluster nodepool create",
+        "pull-secret": "only with pull_secret_path: add it as kube-system/additional-pull-secret",
     },
     "destroy": {
         "cluster": "delete the cluster (its node pools go with it), then sweep "
@@ -247,6 +248,7 @@ _PHASE_NOTES = {
         "plan": "terraform plan - a real diff, and it runs in plan mode too",
         "apply": "terraform apply - creates everything, 15-20 minutes, billable",
         "outputs": "read the API and console URLs back out",
+        "pull-secret": "only with pull_secret_path: add it as kube-system/additional-pull-secret",
     },
     "tf-destroy": {
         "workspace": "refetch the module at the pinned ref, rewrite the tfvars",

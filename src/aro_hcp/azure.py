@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -16,9 +19,29 @@ LONG_TIMEOUT = 2700
 # Command groups that must not carry --subscription (Entra ID commands reject it).
 _NO_SUBSCRIPTION = {"account", "ad", "extension", "login", "logout"}
 
+_GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
 
 class AzNotFound(RuntimeError):
     """The `az` CLI is not on PATH."""
+
+
+def token_object_id(token: str) -> str | None:
+    """The ``oid`` claim of a JWT access token, or None if it has none.
+
+    The signature is not checked: the token came straight from `az`, and only
+    the caller's own object id is read from it.
+    """
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    oid = claims.get("oid") if isinstance(claims, dict) else None
+    return oid if isinstance(oid, str) and _GUID.match(oid) else None
 
 
 def _text(value) -> str:
@@ -81,6 +104,7 @@ class AzCli:
         self.dry_run = dry_run
         self.echo = echo
         self._log: list[AzResult] = []
+        self._principal_oid: str | None = None
 
     @property
     def log(self) -> list[AzResult]:
@@ -179,3 +203,26 @@ class AzCli:
             force=True,
         )
         return result.text or None
+
+    def principal_object_id(self) -> str | None:
+        """Object id of the signed-in principal, from its ARM token's ``oid`` claim.
+
+        The same for users, service principals and managed identities, and
+        needs no Microsoft Graph permission, which a managed identity rarely
+        holds. This is also how the azurerm provider learns its object id.
+        Asked for the configured subscription, so a guest user gets the object
+        id of the tenant that owns it, not of their default account's tenant.
+        """
+        if self._principal_oid:
+            return self._principal_oid
+        result = self.run(
+            ["account", "get-access-token", "--query", "accessToken", "--output", "tsv",
+             *(["--subscription", self.subscription] if self.subscription else [])],
+            check=False,
+            force=True,
+        )
+        if self._log and self._log[-1] is result:
+            # A bearer token is a credential; keep it out of the command log.
+            self._log[-1] = AzResult(result.args, result.returncode, "", result.stderr)
+        self._principal_oid = token_object_id(result.text) if result.ok else None
+        return self._principal_oid

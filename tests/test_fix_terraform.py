@@ -7,6 +7,7 @@ fakes, and nothing reaches Azure.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 from pathlib import Path
@@ -47,6 +48,10 @@ def make_config(**overrides) -> ClusterConfig:
     )
     base.update(overrides)
     return ClusterConfig(**base)
+
+
+NO_DELETES = json.dumps({"resource_changes": [
+    {"address": "module.cluster.azapi_resource.hcp_cluster", "change": {"actions": ["create"]}}]})
 
 
 class Fake:
@@ -320,7 +325,8 @@ def test_non_mutating_build_steps_are_tagged_always():
 
 
 def test_plan_with_changes_reopens_apply(tmp_path):
-    tf = Fake([("plan", (2, "Plan: 0 to add, 1 to change, 0 to destroy.", ""))])
+    tf = Fake([("plan", (2, "Plan: 0 to add, 1 to change, 0 to destroy.", "")),
+               ("show", (0, NO_DELETES, ""))])
     executor = make_executor(tmp_path, tf=tf)
     _complete_everything(executor)
     outcome = executor.run_step(step(executor, "tf-plan"), force=True)
@@ -431,7 +437,7 @@ def test_d31_grants_the_two_roles_on_the_vnet(tmp_path):
         ("identity show --name demo-dp-image-registry", (0, "pid-registry", "")),
         ("role assignment list", (0, "", "")),  # not granted yet
     ], program="az")
-    tf = Fake([("plan", (2, "changes", ""))])
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, NO_DELETES, ""))])
     executor = make_executor(tmp_path, tf=tf, az=az)
     executor.run_all(["apply"])
     creates = [c for c in az.calls if c[:3] == ["role", "assignment", "create"]]
@@ -522,3 +528,220 @@ def test_error_excerpt_starts_at_the_terraform_error():
 def test_error_excerpt_without_error_keeps_the_tail():
     text = "x" * 100 + "the end"
     assert error_excerpt(text, limit=20).endswith("the end")
+
+
+# -- PR review: teardown tfvars satisfy the module --------------------------------
+
+
+@pytest.mark.parametrize("overrides", [dict(skip_nodepool=True), dict(nodepool_replicas=1)])
+def test_teardown_tfvars_always_carry_a_valid_node_pool(overrides):
+    from aro_hcp.terraform import _node_pools
+    config = ClusterConfig(cluster_name="demo", location="eastus2", resource_group="demo-rg",
+                           cluster_version="4.22", nodepool_version="4.22.1",
+                           backend="terraform", **overrides)
+    pools = _node_pools(config, teardown=True)
+    assert len(pools) == 1 and all(p["replicas"] >= 2 for p in pools.values())
+
+
+def test_teardown_tfvars_match_the_build_for_an_ordinary_config():
+    from aro_hcp.terraform import render_tfvars
+    config = ClusterConfig(cluster_name="demo", location="eastus2", resource_group="demo-rg",
+                           cluster_version="4.22", nodepool_version="4.22.1", backend="terraform")
+    assert render_tfvars(config, teardown=True) == render_tfvars(config)
+
+
+def test_destroy_plan_writes_teardown_tfvars(tmp_path):
+    from aro_hcp.terraform import build_terraform_destroy_plan
+    config = ClusterConfig(cluster_name="demo", location="eastus2", resource_group="demo-rg",
+                           cluster_version="4.22", nodepool_version="4.22.1", backend="terraform")
+    write = next(s for s in build_terraform_destroy_plan(config, tmp_path) if s.id == "tf-write-tfvars")
+    assert "--teardown" in write.args
+
+
+# -- open decision 2: apply re-plans, so it refuses deletions unless allowed ------
+
+
+def _deleting(*actions):
+    return json.dumps({"resource_changes": [
+        {"address": f"module.network.res_{i}", "change": {"actions": list(a)}}
+        for i, a in enumerate(actions)]})
+
+
+@pytest.mark.parametrize("actions", [(["delete"],), (["delete", "create"],),
+                                     (["create", "delete"],)])
+def test_apply_refuses_a_plan_that_deletes_or_replaces(tmp_path, actions):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, _deleting(*actions), ""))])
+    executor = make_executor(tmp_path, tf=tf)
+    outcome = executor.run_step(step(executor, "tf-plan"), force=True)
+    assert outcome.status == "failed"
+    assert "module.network.res_0" in outcome.stderr + outcome.message
+    assert "--allow-deletes" in outcome.stderr + outcome.message
+
+
+def test_allow_deletes_lets_the_apply_proceed(tmp_path):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, _deleting(["delete"]), ""))])
+    executor = make_executor(tmp_path, tf=tf)
+    executor.allow_deletes = True
+    assert executor.run_step(step(executor, "tf-plan"), force=True).status == "done"
+
+
+def test_dry_run_plan_only_warns_about_deletes(tmp_path):
+    events = []
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, _deleting(["delete"]), ""))])
+    executor = make_executor(tmp_path, tf=tf, apply=False)
+    executor.on_event = events.append
+    assert executor.run_step(step(executor, "tf-plan"), force=True).status == "done"
+    assert any("would delete or replace" in e for e in events)
+
+
+def test_an_uninspectable_plan_is_refused_on_apply(tmp_path):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (1, "", "boom"))])
+    executor = make_executor(tmp_path, tf=tf)
+    assert executor.run_step(step(executor, "tf-plan"), force=True).status == "failed"
+
+
+def test_updates_and_creates_pass_the_delete_guard(tmp_path):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, _deleting(["update"], ["create"]), ""))])
+    executor = make_executor(tmp_path, tf=tf)
+    assert executor.run_step(step(executor, "tf-plan"), force=True).status == "done"
+
+
+def test_the_inspected_plan_file_is_removed(tmp_path):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, NO_DELETES, ""))])
+    executor = make_executor(tmp_path, tf=tf)
+    plan_step = step(executor, "tf-plan")
+    out = next(a for a in plan_step.args if a.startswith("-out="))
+    Path(out.split("=", 1)[1]).parent.mkdir(parents=True, exist_ok=True)
+    Path(out.split("=", 1)[1]).write_text("secret-bearing plan")
+    executor.run_step(plan_step, force=True)
+    assert not Path(out.split("=", 1)[1]).exists()
+
+
+# -- open decision 3: a branch or tag must not move under a cluster ---------------
+
+
+OLD_SHA = "a" * 40
+NEW_SHA = "b" * 40
+
+
+def _fetch_with(tmp_path, monkeypatch, ref, resolves_to, recorded=None):
+    checkout = tmp_path / "src"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "terraform").mkdir()
+    (checkout / "terraform" / "variables.tf").write_text("")
+    git = FakeGit(head=resolves_to)
+    monkeypatch.setattr(tf_mod, "_git", git)
+    monkeypatch.setattr(tf_mod, "_verify_existing_checkout", lambda _c: "")
+    monkeypatch.setattr(tf_mod, "_resolve_ref", lambda _c, _r: (resolves_to, ""))
+    config = make_config(terraform_ref=ref)
+    executor = make_executor(tmp_path, config, tf=Fake())
+    if recorded:
+        executor.state.set_context(tf_mod.MODULE_COMMIT, recorded)
+    fetch = dataclasses.replace(step(executor, "tf-fetch-module"),
+                                args=["fetch-module", str(checkout)])
+    return executor, tf_mod.action_fetch_module(executor, fetch)
+
+
+def test_a_moved_branch_is_refused(tmp_path, monkeypatch):
+    executor, result = _fetch_with(tmp_path, monkeypatch, "main", NEW_SHA, recorded=OLD_SHA)
+    assert not result.ok
+    assert OLD_SHA in result.stderr and NEW_SHA in result.stderr
+    assert executor.state.get(tf_mod.MODULE_COMMIT) == OLD_SHA
+
+
+def test_the_first_fetch_records_the_commit(tmp_path, monkeypatch):
+    executor, result = _fetch_with(tmp_path, monkeypatch, "main", NEW_SHA)
+    assert result.ok and executor.state.get(tf_mod.MODULE_COMMIT) == NEW_SHA
+
+
+def test_a_deliberate_full_sha_change_is_accepted(tmp_path, monkeypatch):
+    executor, result = _fetch_with(tmp_path, monkeypatch, NEW_SHA, NEW_SHA, recorded=OLD_SHA)
+    assert result.ok and executor.state.get(tf_mod.MODULE_COMMIT) == NEW_SHA
+
+
+def test_cached_checkout_at_the_pinned_sha_still_refuses_auto_tfvars(tmp_path, monkeypatch):
+    checkout = tmp_path / "src"
+    (checkout / "terraform").mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    (checkout / "terraform" / "variables.tf").write_text("")
+    (checkout / "terraform" / "evil.auto.tfvars").write_text('cluster_name = "x"\n')
+    monkeypatch.setattr(tf_mod, "_git", FakeGit(head=TERRAFORM_REF))
+    monkeypatch.setattr(tf_mod, "_verify_existing_checkout", lambda _c: "")
+    executor = make_executor(tmp_path, tf=Fake())
+    fetch = dataclasses.replace(step(executor, "tf-fetch-module"),
+                                args=["fetch-module", str(checkout)])
+    result = tf_mod.action_fetch_module(executor, fetch)
+    assert not result.ok and "evil.auto.tfvars" in result.stderr
+
+
+# -- review of the guard: nothing may get past a refused plan ---------------------
+
+
+def _applies(tf):
+    return [c for c in tf.calls if c[:1] == ["apply"]]
+
+
+def test_keep_going_does_not_get_past_a_refused_plan(tmp_path):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, _deleting(["delete"]), ""))])
+    executor = make_executor(tmp_path, tf=tf, az=Fake(program="az"))
+    for s in executor.plan:
+        if s.phase in ("workspace", "init"):
+            executor.state.record(s.id, "done")
+    executor.run_all(["plan", "apply"], stop_on_error=False)
+    assert not _applies(tf)
+
+
+def test_phase_apply_alone_still_plans_and_guards(tmp_path):
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, _deleting(["delete"]), ""))])
+    executor = make_executor(tmp_path, tf=tf, az=Fake(program="az"))
+    executor.state.record("tf-plan", "done")  # from an earlier run
+    executor.run_all(["apply"], stop_on_error=False)
+    assert not _applies(tf)
+
+
+def test_running_the_apply_phase_directly_needs_a_plan_from_this_run(tmp_path):
+    # The agent's execute_phase calls run_phase, which does not refresh the
+    # plan the way run_all does; an earlier run's record must not stand in.
+    tf = Fake([("plan", (2, "changes", "")), ("show", (0, NO_DELETES, ""))])
+    executor = make_executor(tmp_path, tf=tf, az=Fake(program="az"))
+    executor.state.record("tf-plan", "done")
+    executor.run_phase("apply", stop_on_error=False)
+    assert not _applies(tf)
+    assert "succeed in this run" in executor.state.steps["tf-apply"]["detail"]
+
+
+def test_teardown_checks_out_the_recorded_commit(tmp_path, monkeypatch):
+    checkout = tmp_path / "src"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "terraform").mkdir()
+    (checkout / "terraform" / "variables.tf").write_text("")
+    resolved = []
+    monkeypatch.setattr(tf_mod, "_git", FakeGit(head=NEW_SHA))
+    monkeypatch.setattr(tf_mod, "_verify_existing_checkout", lambda _c: "")
+
+    def resolve(_checkout, ref):
+        resolved.append(ref)
+        return ref, ""
+
+    monkeypatch.setattr(tf_mod, "_resolve_ref", resolve)
+    config = make_config(terraform_ref="main")
+    executor = make_executor(tmp_path, config, tf=Fake(), destroy=True)
+    executor.state.set_context(tf_mod.MODULE_COMMIT, OLD_SHA)
+    fetch = dataclasses.replace(step(executor, "tf-fetch-module"),
+                                args=["fetch-module", str(checkout), "--teardown"])
+    git = FakeGit(head=NEW_SHA)  # the checkout sits where the branch moved to
+
+    def checkout_moves_head(*args, cwd=None):
+        if args[0] == "checkout":
+            git.head = args[-1]
+        return git(*args, cwd=cwd)
+
+    monkeypatch.setattr(tf_mod, "_git", checkout_moves_head)
+    result = tf_mod.action_fetch_module(executor, fetch)
+    assert result.ok and resolved == [OLD_SHA] and git.head == OLD_SHA
+
+
+def test_teardown_tfvars_replace_an_invalid_node_pool_name():
+    from aro_hcp.terraform import _node_pools
+    config = make_config(skip_nodepool=True, nodepool_name="np_1")
+    assert list(_node_pools(config, teardown=True)) == ["np-1"]

@@ -73,7 +73,7 @@ def test_private_endpoint_forces_private_vault_visibility():
 
 def test_plan_covers_every_phase_in_order():
     phases = []
-    for step in build_plan(make_config()):
+    for step in build_plan(make_config(pull_secret_path="/secrets/ps.json")):
         if step.phase not in phases:
             phases.append(step.phase)
     assert phases == list(PHASES)
@@ -658,3 +658,20 @@ def test_available_versions_pass():
     findings = check_versions(az, make_config())
     assert all(f.status == OK for f in findings)
     assert {f.check for f in findings} == {"region", "cluster-version", "nodepool-version"}
+
+
+def test_crypto_officer_grant_needs_no_graph_lookup():
+    # A managed-identity login usually cannot read Graph, and --assignee
+    # resolves through it; the object id and type are passed explicitly.
+    step = next(s for s in build_plan(make_config()) if s.id == "keyvault-crypto-officer")
+    assert "--assignee" not in step.args and "--assignee" not in step.exists
+    args = step.args
+    assert args[args.index("--assignee-object-id") + 1] == "${SIGNED_IN_USER}"
+    assert args[args.index("--assignee-principal-type") + 1] == "${SIGNED_IN_PRINCIPAL_TYPE}"
+    assert "SIGNED_IN_PRINCIPAL_TYPE" in step.requires
+
+
+def test_role_assignment_probes_use_object_id():
+    probes = [s.exists for s in build_plan(make_config())
+              if "role-assignment" in s.tags and s.exists]
+    assert probes and all("--assignee-object-id" in p and "--assignee" not in p for p in probes)

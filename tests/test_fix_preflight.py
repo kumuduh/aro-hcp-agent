@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import shutil
+import subprocess
 
 import pytest
 
 from aro_hcp import preflight
-from aro_hcp.azure import AzCli, AzResult
+from aro_hcp.azure import AzCli, AzResult, token_object_id
 from aro_hcp.config import ClusterConfig
+from aro_hcp.executor import resolve_signed_in_user
 from aro_hcp.preflight import FAIL, OK, WARN, run_preflight
+from aro_hcp.state import RunState
 
 SUB = "00000000-0000-0000-0000-000000000001"
 NOT_FOUND = (3, "", "ERROR: (ResourceNotFound) The Resource was not found.")
@@ -97,13 +101,95 @@ def test_healthy_environment_passes_with_every_check_ok():
 # -- N1 managed identity -----------------------------------------------------
 
 
+MI_OID = "11111111-2222-3333-4444-555555555555"
+
+
+def jwt(claims):
+    body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJSUzI1NiJ9.{body}.signature"
+
+
 @pytest.mark.parametrize("literal", ["systemAssignedIdentity", "userAssignedIdentity"])
-def test_managed_identity_login_blocks(literal):
-    az = az_with(**{"account show --query user.name": (0, literal + "\n", "")})
+def test_managed_identity_login_passes_with_its_object_id(literal):
+    az = az_with(**{
+        "account show --query user.name": (0, literal + "\n", ""),
+        "account show --query user.type": (0, "servicePrincipal\n", ""),
+        "get-access-token": (0, jwt({"oid": MI_OID, "idtyp": "app"}) + "\n", ""),
+    })
+    report = run_preflight(az, config())
+    ident = by_check(report.findings, "identity")[0]
+    assert ident.status == OK and MI_OID in ident.message
+    assert by_check(report.findings, "permissions")[0].status == OK
+    listing = [c for c in az.calls if c[:3] == ["role", "assignment", "list"]][0]
+    assert listing[listing.index("--assignee-object-id") + 1] == MI_OID
+    # No Graph lookup: a managed identity usually cannot read Graph.
+    assert not [c for c in az.calls if c[:1] == ["ad"]]
+
+
+@pytest.mark.parametrize("literal", ["systemAssignedIdentity", "userAssignedIdentity"])
+def test_managed_identity_without_object_id_blocks(literal):
+    az = az_with(**{"account show --query user.name": (0, literal + "\n", ""),
+                    "get-access-token": (1, "", "ERROR: no token")})
     report = run_preflight(az, config())
     ident = by_check(report.findings, "identity")[0]
     assert ident.status == FAIL and ident.remedy
     assert by_check(report.findings, "permissions")[0].status == WARN
+
+
+def test_managed_identity_login_passes_on_terraform_backend():
+    az = az_with(**{
+        "account show --query user.name": (0, "systemAssignedIdentity\n", ""),
+        "get-access-token": (0, jwt({"oid": MI_OID}) + "\n", ""),
+    })
+    findings = preflight.check_login(az, config(backend="terraform"))
+    assert by_check(findings, "identity")[0].status == OK
+
+
+@pytest.mark.parametrize("token", [
+    "not-a-jwt", "a.!!!.c", jwt({"sub": "x"}), jwt({"oid": "not-a-guid"}), jwt(["oid"]),
+])
+def test_token_object_id_rejects_unusable_tokens(token):
+    assert token_object_id(token) is None
+
+
+def test_token_object_id_reads_oid():
+    assert token_object_id(jwt({"oid": MI_OID}) + "\n") == MI_OID
+
+
+def test_access_token_is_kept_out_of_the_command_log(monkeypatch):
+    token = jwt({"oid": MI_OID})
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, token + "\n", ""))
+    az = AzCli(SUB)
+    assert az.principal_object_id() == MI_OID
+    assert all(token not in r.stdout for r in az.log)
+
+
+@pytest.mark.parametrize("user_type, expected", [
+    ("user", "User"), ("servicePrincipal", "ServicePrincipal"),
+])
+def test_signed_in_principal_type_is_recorded(tmp_path, user_type, expected):
+    az = az_with(**{"account show --query user.type": (0, user_type + "\n", ""),
+                    "get-access-token": (0, jwt({"oid": MI_OID}) + "\n", "")})
+    state = RunState(path=tmp_path / "s.json")
+    assert resolve_signed_in_user(az, state) == MI_OID
+    assert state.get("SIGNED_IN_PRINCIPAL_TYPE") == expected
+
+
+def test_managed_identity_is_recorded_as_service_principal(tmp_path):
+    az = az_with(**{"account show --query user.name": (0, "userAssignedIdentity\n", ""),
+                    "get-access-token": (0, jwt({"oid": MI_OID}) + "\n", "")})
+    state = RunState(path=tmp_path / "s.json")
+    assert resolve_signed_in_user(az, state) == MI_OID
+    assert state.get("SIGNED_IN_PRINCIPAL_TYPE") == "ServicePrincipal"
+
+
+def test_login_name_from_older_state_is_re_resolved(tmp_path):
+    state = RunState(path=tmp_path / "s.json")
+    state.set_context("SIGNED_IN_USER", "qa@example.com")
+    az = az_with(**{"get-access-token": (0, jwt({"oid": MI_OID}) + "\n", "")})
+    assert resolve_signed_in_user(az, state) == MI_OID
+    assert state.get("SIGNED_IN_PRINCIPAL_TYPE") == "User"
 
 
 # -- O2 role-assignment rights ----------------------------------------------
@@ -125,7 +211,7 @@ def test_permission_uses_object_id_for_users():
     az = az_with()
     preflight.check_role_assignment_permission(az, config())
     listing = [c for c in az.calls if c[:3] == ["role", "assignment", "list"]][0]
-    assert listing[listing.index("--assignee") + 1] == "oid-1"
+    assert listing[listing.index("--assignee-object-id") + 1] == "oid-1"
     assert "--include-groups" in listing and "--include-inherited" in listing
 
 
@@ -137,7 +223,7 @@ def test_permission_resolves_service_principal_object_id():
     })
     preflight.check_role_assignment_permission(az, config())
     listing = [c for c in az.calls if c[:3] == ["role", "assignment", "list"]][0]
-    assert listing[listing.index("--assignee") + 1] == "sp-oid"
+    assert listing[listing.index("--assignee-object-id") + 1] == "sp-oid"
 
 
 def test_permission_contributor_only_fails_with_grant_command():
@@ -390,3 +476,10 @@ def test_existing_compatible_vnet_is_ok():
                        "subnets": [{"name": "worker-subnet", "addressPrefix": "10.0.0.0/24"}]})
     f = preflight.check_existing_vnet(az_with(**{"vnet show": (0, vnet, "")}), config())[0]
     assert f.status == OK
+
+
+def test_access_token_is_for_the_configured_subscription_and_fetched_once():
+    az = az_with(**{"get-access-token": (0, jwt({"oid": MI_OID}) + "\n", "")})
+    assert az.principal_object_id() == az.principal_object_id() == MI_OID
+    calls = [c for c in az.calls if "get-access-token" in c]
+    assert len(calls) == 1 and calls[0][calls[0].index("--subscription") + 1] == SUB

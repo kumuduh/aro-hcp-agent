@@ -295,7 +295,7 @@ def test_tool_descriptions_follow_destroy_plan(tmp_path):
 
 
 def test_tool_descriptions_follow_terraform_plans(tmp_path):
-    config = make_config(backend="terraform")
+    config = make_config(backend="terraform", pull_secret_path="/secrets/ps.json")
     for plan, phases in ((build_terraform_plan(config, tmp_path), TERRAFORM_PHASES),
                          (build_terraform_destroy_plan(config, tmp_path), TERRAFORM_DESTROY_PHASES)):
         tools, *_ = make_tools(tmp_path, plan=plan, config=config,

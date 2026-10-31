@@ -492,3 +492,90 @@ def test_live_regression_teardown_of_a_private_cluster_needs_no_flag(tmp_path, m
     assert cli.main(["destroy", "-c", str(cfg), "--state-dir", str(tmp_path)]) == cli.EXIT_OK
     # The build still requires the flag.
     assert cli.main(["plan", "-c", str(cfg), "--state-dir", str(tmp_path)]) == cli.EXIT_USAGE
+
+
+# -- PR review: teardown safety ---------------------------------------------------
+
+
+@pytest.mark.parametrize("err", [
+    (1, "", "ERROR: (SubscriptionNotFound) The subscription 'x' could not be found.\n"
+            "Code: SubscriptionNotFound"),
+    (1, "", "ERROR: (InvalidResourceType) The resource type 'networkSecurityGroups' could "
+            "not be found in the namespace 'Microsoft.Network' for api version '2099-01-01'."),
+    (1, "", "ERROR: (NoRegisteredProviderFound) No registered resource provider found."),
+])
+def test_scope_errors_are_not_already_gone(tmp_path, err):
+    az = FakeAzure(errors={"nsg show": err})
+    ex = executor(tmp_path, plan=build_destroy_plan(make_config()), az=az)
+    ex.state.record("vnet-delete", "done")
+    outcome = ex.run_step(step(ex, "nsg-delete"))
+    assert outcome.status == "failed"
+
+
+@pytest.mark.parametrize("err", [
+    (3, "", "ERROR: (ResourceNotFound) The Resource 'x' was not found."),
+    (3, "", "ERROR: (NotFound) Resource /subscriptions/x/subnets/y not found.\nCode: NotFound"),
+])
+def test_resource_not_found_is_still_already_gone(tmp_path, err):
+    az = FakeAzure(errors={"nsg show": err})
+    ex = executor(tmp_path, plan=build_destroy_plan(make_config()), az=az)
+    ex.state.record("vnet-delete", "done")
+    assert ex.run_step(step(ex, "nsg-delete")).status == "skipped"
+
+
+def _write_config(tmp_path, extra=""):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"cluster_name: demo\nlocation: eastus2\nresource_group: demo-rg\n"
+                   f"cluster_version: '4.22'\nnodepool_version: '4.22.1'\nsubscription_id: {SUB}\n"
+                   + extra)
+    return cfg
+
+
+def test_declined_teardown_phase_keeps_state_and_says_so(tmp_path, monkeypatch):
+    cfg = _write_config(tmp_path)
+    az = FakeAzure({"aro hcp cluster:demo": f"/subscriptions/{SUB}/x"})
+    monkeypatch.setattr(cli, "AzCli", lambda *a, **k: az)
+    monkeypatch.setattr(cli, "_confirm_destroy", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_interactive_confirm", lambda phase, steps: False)
+    build = tmp_path / "st" / "demo.state.json"
+    build.parent.mkdir()
+    build.write_text(json.dumps({"version": 1, "cluster_name": "demo", "steps": {}}))
+    rc = cli.main(["destroy", "-c", str(cfg), "--state-dir", str(tmp_path / "st"),
+                   "--apply", "--confirm-each-phase", "-q"])
+    assert rc == cli.EXIT_DECLINED
+    assert build.exists()
+    assert "aro hcp cluster:demo" in az.existing
+
+
+def test_teardown_with_an_unfinished_step_keeps_state(tmp_path, monkeypatch):
+    cfg = _write_config(tmp_path)
+    monkeypatch.setattr(cli, "AzCli", lambda *a, **k: FakeAzure())
+    monkeypatch.setattr(Executor, "pending", lambda self, phases=None: self.plan[:1])
+    build = tmp_path / "st" / "demo.state.json"
+    build.parent.mkdir()
+    build.write_text(json.dumps({"version": 1, "cluster_name": "demo", "steps": {}}))
+    rc = cli.main(["destroy", "-c", str(cfg), "--state-dir", str(tmp_path / "st"),
+                   "--apply", "-y", "-q"])
+    assert rc == cli.EXIT_INCOMPLETE
+    assert build.exists()
+
+
+@pytest.mark.parametrize("extra", [
+    "vnet_integration_subnet_prefix: 10.0.1.0/29\n",   # below the /28 minimum
+    "vnet_address_prefix: 10.128.0.0/16\nworker_subnet_prefix: 10.128.0.0/24\n"
+    "vnet_integration_subnet_prefix: 10.128.1.0/24\n",  # overlaps the pod CIDR
+    "nodepool_name: Pool_1\n",
+    "nodepool_replicas: 1\nbackend: terraform\n",
+    "skip_nodepool: true\nbackend: terraform\n",
+    "vault_visibility: Private\nbackend: terraform\n",
+])
+def test_build_only_rules_never_block_a_teardown(tmp_path, monkeypatch, extra):
+    cfg = _write_config(tmp_path, extra)
+    monkeypatch.setattr(cli, "AzCli", lambda *a, **k: FakeAzure())
+    config = ClusterConfig.load(cfg)
+    assert config.validate() and not config.validate(teardown=True)
+
+
+def test_teardown_still_checks_what_locates_the_resources():
+    config = make_config(resource_group="bad name!", managed_resource_group="demo-managed-rg")
+    assert config.validate(teardown=True)

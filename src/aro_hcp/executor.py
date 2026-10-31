@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from . import state as state_mod
-from .azure import AzCli, AzError, AzResult  # noqa: F401  (AzError re-exported)
+from .azure import _GUID, AzCli, AzError, AzResult  # noqa: F401  (AzError re-exported)
 from .config import ClusterConfig
 from .plan import IN_PROGRESS_STATES, Step
 from .state import RunState
@@ -29,7 +29,9 @@ _BENIGN = (
 _BENIGN_UNPROBED = ("RoleAssignmentExists", "The role assignment already exists")
 
 #: Substrings that mean a resource is not there. Used to read both a failed
-#: delete and a failed existence probe; anything else is "unknown".
+#: delete and a failed existence probe; anything else is "unknown". The bare
+#: code (the network RP's, for subnets) is matched only as az prints a code,
+#: so SubscriptionNotFound and the like do not contain it.
 _NOT_FOUND = (
     "ResourceNotFound",
     "ResourceGroupNotFound",
@@ -37,10 +39,24 @@ _NOT_FOUND = (
     "DeletedVaultNotFound",
     "VaultNotFound",
     "KeyNotFound",
+    "(NotFound)",
+    "Code: NotFound",
     "could not be found",
     "was not found",
     "does not exist",
-    "NotFound",
+)
+
+#: Errors about the lookup's scope (subscription, resource type, provider),
+#: not the resource. Their messages also say "could not be found", so they
+#: veto _NOT_FOUND: read as "absent", one would certify a teardown clean
+#: while everything in it still runs.
+_SCOPE_ERRORS = (
+    "SubscriptionNotFound",
+    "InvalidSubscriptionId",
+    "InvalidResourceType",
+    "InvalidResourceNamespace",
+    "NoRegisteredProviderFound",
+    "MissingSubscriptionRegistration",
 )
 
 #: Substrings that mean "Azure has not finished propagating a role assignment",
@@ -109,6 +125,7 @@ class Executor:
         runners: dict[str, object] | None = None,
         poll_interval: float = POLL_INTERVAL,
         fingerprint: dict[str, str] | None = None,
+        allow_deletes: bool = False,
     ) -> None:
         self.config = config
         self.plan = plan
@@ -124,7 +141,12 @@ class Executor:
         self.retry_delays = retry_delays
         self.sleep = sleep
         self.poll_interval = poll_interval
+        #: The operator accepted that this apply may delete or replace
+        #: resources (terraform backend; see action_terraform_plan).
+        self.allow_deletes = allow_deletes
         self._confirmed_phases: set[str] = set()
+        #: Steps that completed in this invocation (see _check_after).
+        self._ran: set[str] = set()
         #: Set when the operator declines a phase; the rest of the run stops.
         self.declined = False
         #: Set when a long-running operation is still in progress; the run
@@ -391,7 +413,7 @@ class Executor:
         err = probe.stderr.strip() or probe.stdout.strip() or f"exit {probe.returncode}"
         if self._is_transient(probe) or probe.returncode == 124:
             return UNKNOWN, "", err
-        if self._matches(probe, _NOT_FOUND):
+        if self._not_found(probe):
             return ABSENT, "", err
         return UNKNOWN, "", err
 
@@ -525,7 +547,7 @@ class Executor:
         # A retry budget exhausted on propagation lag is still a failure, even
         # when its text also contains a "not found" phrase.
         if not self._is_transient(result):
-            if step.deletes and self._matches(result, _NOT_FOUND):
+            if step.deletes and self._not_found(result):
                 self._record(step.id, state_mod.SKIPPED, command=command, detail=detail)
                 return StepOutcome(step, state_mod.SKIPPED, command, stderr=result.stderr,
                                    message="already gone")
@@ -559,6 +581,16 @@ class Executor:
         by_id = self.steps_by_id()
         for dep_id in step.after:
             dep = by_id.get(dep_id)
+            if dep is not None and self._always(dep) and dep_id not in self._ran:
+                # A step that re-runs every time (terraform plan) only vouches
+                # for this invocation; an earlier run's record says nothing
+                # about what would happen now.
+                reason = (f"needs {dep_id} ({dep.description}) to succeed in this run "
+                          "first; run all phases, or include its phase")
+                if self.apply:
+                    raise StepBlocked(step.id, reason)
+                self.on_event(f"plan  {step.id}: waits for {dep_id}")
+                return
             if dep is None or self.state.is_complete(dep_id):
                 continue
             satisfied = False
@@ -604,9 +636,10 @@ class Executor:
 
     def _run_action(self, step: Step) -> AzResult:
         """Run an in-process step (fetching the module, writing tfvars)."""
-        from .terraform import ACTIONS  # local: terraform.py imports from plan
+        from .pullsecret import ACTIONS as PULL_SECRET_ACTIONS  # local: both import plan
+        from .terraform import ACTIONS
 
-        handler = ACTIONS.get(step.action or "")
+        handler = {**ACTIONS, **PULL_SECRET_ACTIONS}.get(step.action or "")
         if handler is None:
             return AzResult([step.action or "?"], 1, "", f"unknown action {step.action!r}")
         try:
@@ -617,6 +650,10 @@ class Executor:
             )
 
     def _record(self, step_id: str, status: str, *, command: str = "", detail: str = "") -> None:
+        if status in (state_mod.DONE, state_mod.SKIPPED):
+            self._ran.add(step_id)
+        else:
+            self._ran.discard(step_id)
         if self.persist:
             self.state.record(step_id, status, command=command, detail=detail)
             # Saved per step, not per phase: an interrupted run must not lose
@@ -637,8 +674,12 @@ class Executor:
         return any(marker.lower() in blob for marker in markers)
 
     @classmethod
+    def _not_found(cls, result: AzResult) -> bool:
+        return cls._matches(result, _NOT_FOUND) and not cls._matches(result, _SCOPE_ERRORS)
+
+    @classmethod
     def _is_benign(cls, result: AzResult, *, deletes: bool = False) -> bool:
-        return cls._matches(result, _NOT_FOUND if deletes else _BENIGN)
+        return cls._not_found(result) if deletes else cls._matches(result, _BENIGN)
 
     @classmethod
     def _is_transient(cls, result: AzResult) -> bool:
@@ -663,20 +704,24 @@ class Executor:
 
 
 def resolve_signed_in_user(az: AzCli, run_state: RunState) -> str:
-    """Populate ``SIGNED_IN_USER``, needed by the Key Vault Crypto Officer grant.
+    """Populate ``SIGNED_IN_USER`` and ``SIGNED_IN_PRINCIPAL_TYPE``.
 
-    The object id is preferred over ``account show``'s user name: under a
-    managed-identity login that name is the literal "systemAssignedIdentity",
-    which is not a principal and made the grant fail late. When no assignee
-    can be resolved the variable stays unset, so the grant fails up front as
-    "unresolved" (and preflight has already said why).
+    The Key Vault Crypto Officer grant needs both: the principal's object id
+    (never its login name; under a managed-identity login that is the literal
+    "systemAssignedIdentity") and whether it is a User or a ServicePrincipal.
+    A stored value that is not an object id predates this and is re-resolved.
+    When nothing resolves the variables stay unset, so the grant fails up
+    front as "unresolved" (and preflight has already said why).
     """
-    from .preflight import _resolve_principal  # local: preflight imports config only
+    # local: preflight imports config only
+    from .preflight import _resolve_principal, principal_type
 
     existing = run_state.get("SIGNED_IN_USER")
-    if existing:
+    if (existing and _GUID.match(existing)
+            and run_state.get("SIGNED_IN_PRINCIPAL_TYPE")):
         return existing
-    assignee, _kind = _resolve_principal(az)
+    assignee, kind = _resolve_principal(az)
     if assignee:
         run_state.set_context("SIGNED_IN_USER", assignee)
+        run_state.set_context("SIGNED_IN_PRINCIPAL_TYPE", principal_type(kind))
     return assignee

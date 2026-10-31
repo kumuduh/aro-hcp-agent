@@ -17,8 +17,10 @@ from .destroy import DESTROY_PHASES, build_destroy_plan
 from .executor import Executor, resolve_signed_in_user
 from .plan import PHASES, build_plan
 from .preflight import FAIL, OK, WARN, run_preflight
+from . import pullsecret
 from .state import RunState, StateError, default_state_path, destroy_state_path
 from .terraform import (
+    MODULE_COMMIT,
     TERRAFORM_DESTROY_PHASES,
     TERRAFORM_PHASES,
     build_terraform_destroy_plan,
@@ -181,16 +183,13 @@ def _check_writable(path: Path) -> None:
 
 
 def _setup(
-    args: argparse.Namespace, *, apply: bool, destroy: bool = False
+    args: argparse.Namespace, *, apply: bool, destroy: bool = False, build: bool = True
 ) -> tuple[ClusterConfig, Executor]:
     config = _load_config(args)
-    if (destroy and config.backend != "terraform" and config.vault_visibility == "Private"
-            and not config.keyvault_private_endpoint):
-        # The flag guards a build against a "Private" setting on a public
-        # vault. Teardown handles the private endpoint whether or not it was
-        # passed, and must never be blocked by forgetting it.
-        config = config.with_overrides(keyvault_private_endpoint=True)
-    config.require_valid()
+    # Build-only rules (a private vault needing --keyvault-private-endpoint,
+    # node pool limits, network sizing, a readable pull secret) must never
+    # block a teardown, or a status report.
+    config.require_valid(teardown=destroy or not build)
 
     terraform = config.backend == "terraform"
     phases = getattr(args, "phase", None) or []
@@ -215,6 +214,13 @@ def _setup(
     if apply:
         _check_writable(state_path)
     run_state = RunState.load(state_path)
+    if destroy and terraform and not run_state.get(MODULE_COMMIT) and _build.exists():
+        # Tear down with the module commit the build used, not wherever a
+        # branch in terraform_ref points today.
+        try:
+            run_state.set_context(MODULE_COMMIT, RunState.load(_build).get(MODULE_COMMIT))
+        except StateError:
+            pass  # the mixed-backend guard below reports an unreadable file
 
     _guard_mixed_backends(config, args.state_dir, apply=apply, destroy=destroy,
                           custom_state=args.state)
@@ -248,8 +254,11 @@ def _setup(
         ),
         runners=runners,
         fingerprint=_fingerprint(config, destroy=destroy),
+        allow_deletes=getattr(args, "allow_deletes", False),
     )
     resolve_signed_in_user(az, run_state)
+    if not destroy:
+        pullsecret.invalidate_if_changed(config, run_state)
     return config, executor
 
 
@@ -647,8 +656,22 @@ def cmd_destroy(args: argparse.Namespace) -> int:
     if executor.halted:
         print("\nA delete is still in progress; re-run `aro-hcp destroy --apply` when it finishes.")
         return EXIT_INCOMPLETE
+    if executor.declined:
+        # Nothing failed, but the declined phases still exist: keep both state
+        # files so the next teardown knows what is left.
+        print("\nTeardown stopped at your request; the remaining resources still exist. "
+              "Re-run `aro-hcp destroy --apply` to continue.")
+        return EXIT_DECLINED
     if args.phase:
         return EXIT_OK
+    pending = executor.pending()
+    if pending:
+        # The state files are the only record of what is left; they are
+        # retired on positive evidence that every step finished, not on the
+        # absence of a failure.
+        print(f"\n{len(pending)} teardown step(s) did not complete "
+              f"({', '.join(s.id for s in pending[:5])}); re-run `aro-hcp destroy --apply`.")
+        return EXIT_INCOMPLETE
 
     # The teardown is complete, so both records of this lifecycle go: the
     # build state describes resources that no longer exist (the next apply
@@ -664,7 +687,7 @@ def cmd_destroy(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    config, executor = _setup(args, apply=False)
+    config, executor = _setup(args, apply=False, build=False)
     summary = executor.state.summary()
     failed = {sid: executor.state.steps[sid].get("detail", "")
               for sid in executor.state.steps
@@ -840,6 +863,11 @@ vault_visibility: Public      # Public | Private
 nodepool_name: np-1
 nodepool_replicas: 2
 nodepool_vm_size: Standard_D8s_v6
+
+# A Red Hat pull secret, so the cluster can pull Red Hat images and
+# OperatorHub content. Added as kube-system/additional-pull-secret; needs `oc`
+# or `kubectl`. Relative paths are relative to this file. Never commit it.
+# pull_secret_path: ./pull-secret.json
 """
     try:
         path.write_text(template)
@@ -930,6 +958,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="run only this phase of the selected backend (repeatable)")
     p_apply.add_argument("--skip-preflight", action="store_true",
                          help="run without environment checks (recorded in state)")
+    p_apply.add_argument("--allow-deletes", action="store_true",
+                         help="terraform backend: apply even if the fresh plan deletes or "
+                         "replaces resources (refused by default)")
     p_apply.add_argument("--keep-going", action="store_true",
                          help="continue past a failure to steps that do not depend on it")
     p_apply.set_defaults(func=cmd_apply)

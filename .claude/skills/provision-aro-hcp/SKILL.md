@@ -77,7 +77,9 @@ clone of that repo, prefix them with `uv run` instead. Check with
    then edit it with their values. Required: `cluster_name`, `location`,
    `resource_group`, `cluster_version`, `nodepool_version`. Everything else is
    derived from `cluster_name`. Settle the backend here, before anything is
-   built — every later command needs the same one.
+   built — every later command needs the same one. If the user wants Red Hat
+   images or OperatorHub content, set `pull_secret_path:` to their pull secret
+   (relative to the config file); never read, print or commit its contents.
 
 2. **Preflight.** `aro-hcp preflight -c cluster.yaml`
    Resolve every `FAIL` before going further. Common ones:
@@ -87,6 +89,11 @@ clone of that repo, prefix them with `uv run` instead. Check with
    - `managed-rg` — a stale managed resource group must be deleted first.
    - `terraform` / `terraform-module` — only on that backend; the binary is
      missing or older than the module's `required_version`.
+   - `pull-secret` — `pull_secret_path` is set but neither `oc` nor `kubectl`
+     is on PATH.
+   - `identity` — users, service principals and managed identities
+     (`az login --identity`) all work; a FAIL means the principal's object id
+     could not be read from its access token.
 
 3. **Plan.** `aro-hcp plan -c cluster.yaml -v`
    Show the user the phase breakdown and the pending write count. Nothing is
@@ -105,7 +112,11 @@ clone of that repo, prefix them with `uv run` instead. Check with
    stop between phases. Add `-y` only if the user asked for unattended, or
    `--confirm-each-phase` if they want to approve each one. Phases run in
    order: providers → resource-group → network → identities →
-   role-assignments → etcd-encryption → cluster → nodepool.
+   role-assignments → etcd-encryption → cluster → nodepool → pull-secret
+   (the last only with `pull_secret_path`).
+   On the terraform backend, apply refuses a fresh plan that deletes or
+   replaces anything. Show the user the listed resources; pass
+   `--allow-deletes` only after they confirm those deletions are intended.
 
 6. **Resume.** Apply is idempotent and writes state to `.aro-hcp/<cluster>.state.json`
    after every step. Completed steps are re-checked against Azure, so a resource
@@ -184,11 +195,16 @@ On `terraform`, phases are `workspace` → `init` → `nodepool-state` → `dest
 | `another aro-hcp run is using ...` | A concurrent run holds the state lock | Wait for it; never run two applies against one cluster |
 | `blocked: needs cluster-delete first` | A teardown step's prerequisite (usually the cluster) still exists | Run the earlier phase; never force past it — the vault holds the live etcd key |
 | `exists but is still Provisioning` (exit 5) | A long-running create has not finished | Wait, then re-run apply |
+| `terraform plan would delete or replace N resource(s)` | Drift, or a module change, makes the plan remove something | Show the user the list and `aro-hcp plan --backend terraform -v`; re-run with `--allow-deletes` only on their explicit go-ahead |
+| `terraform_ref 'X' now resolves to …, but this cluster's state records …` | A branch or tag in `terraform_ref` moved upstream | Pin `terraform_ref` to the recorded SHA to keep the module the cluster was built with; moving to the new SHA is the user's decision |
+| `pull-secret` step: `Unauthorized` / connection errors after retries | The API is unreachable from here (often `api_visibility: Private`) | Re-run `apply --phase pull-secret` from a host that reaches the API |
 
 ## Scoped runs
 
 - One phase: `apply --phase network`, or `--phase plan` on the terraform backend
 - Skip the node pool: set `skip_nodepool: true`
+- Add or rotate only the pull secret: `apply --phase pull-secret` (re-applied
+  whenever the file's content changes)
 - Private Key Vault: pass `--keyvault-private-endpoint` (forces
   `vault_visibility: Private` and adds the private endpoint + DNS steps).
   **az-cli backend only** — the upstream module has no equivalent, and the

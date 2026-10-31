@@ -204,7 +204,8 @@ def test_tfvars_renders_booleans_and_numbers_unquoted():
 
 
 def test_plan_phases_are_in_order():
-    phases = list(dict.fromkeys(s.phase for s in build_terraform_plan(make_config())))
+    config = make_config(pull_secret_path="/secrets/ps.json")
+    phases = list(dict.fromkeys(s.phase for s in build_terraform_plan(config)))
     assert phases == list(TERRAFORM_PHASES)
 
 

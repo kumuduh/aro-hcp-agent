@@ -19,3 +19,8 @@ wheels/
 # `aro-hcp init` writes cluster.yaml, which names real resources in a real
 # subscription and should not be shared by accident.
 cluster.yaml
+
+# Red Hat pull secrets (pull_secret_path). Credentials; never commit them.
+pull-secret.json
+pull-secret.txt
+*pull-secret*.json
