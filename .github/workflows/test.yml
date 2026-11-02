@@ -19,5 +19,5 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --python ${{ matrix.python }}
+      - run: uv sync --locked --python ${{ matrix.python }}
       - run: uv run pytest -q

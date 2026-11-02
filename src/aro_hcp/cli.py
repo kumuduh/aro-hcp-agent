@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -16,19 +17,32 @@ from .destroy import DESTROY_PHASES, build_destroy_plan
 from .executor import Executor, resolve_signed_in_user
 from .plan import PHASES, build_plan
 from .preflight import FAIL, OK, WARN, run_preflight
-from .state import RunState, default_state_path
+from . import pullsecret
+from .state import RunState, StateError, default_state_path, destroy_state_path
 from .terraform import (
+    MODULE_COMMIT,
     TERRAFORM_DESTROY_PHASES,
     TERRAFORM_PHASES,
     build_terraform_destroy_plan,
     build_terraform_plan,
     make_runner,
+    plan_json,
 )
 
-#: --phase accepts any phase from any backend; _setup builds the plan that
-#: decides which of them actually exist for this run.
+#: --phase accepts any phase from any backend at parse time; _setup rejects
+#: one that the selected backend does not have.
 ALL_PHASES = tuple(dict.fromkeys(PHASES + TERRAFORM_PHASES))
 ALL_DESTROY_PHASES = tuple(dict.fromkeys(DESTROY_PHASES + TERRAFORM_DESTROY_PHASES))
+
+#: Exit codes. Distinct, so a wrapper script can tell "nothing happened" from
+#: "half happened" without parsing output.
+EXIT_OK = 0
+EXIT_FAILED = 1        # a step failed
+EXIT_USAGE = 2         # config, state or argument problem; nothing ran
+EXIT_DECLINED = 3      # the operator (or a non-TTY) declined
+EXIT_BLOCKED = 4       # preflight failed
+EXIT_INCOMPLETE = 5    # nothing failed, but requested work is still pending
+EXIT_INTERRUPTED = 130
 
 STATUS_MARK = {OK: "ok  ", WARN: "warn", FAIL: "FAIL"}
 STEP_MARK = {
@@ -37,6 +51,17 @@ STEP_MARK = {
     state_mod.FAILED: "FAIL",
     state_mod.PENDING: "    ",
 }
+
+#: Settings a completed step depends on. Changing one after a partial build
+#: would leave completed steps describing resources the config no longer
+#: asks for, so a resume with different values is refused.
+_FINGERPRINT_KEYS = (
+    "location", "resource_group", "managed_resource_group", "backend",
+    "cluster_version", "channel_group", "vnet_address_prefix", "worker_subnet_prefix",
+    "vnet_integration_subnet_prefix", "api_visibility", "ingress_visibility",
+    "vault_visibility", "nodepool_name", "nodepool_vm_size", "nodepool_replicas",
+    "nodepool_version", "terraform_ref",
+)
 
 
 def _eprint(*args) -> None:
@@ -48,85 +73,160 @@ def _load_config(args: argparse.Namespace) -> ClusterConfig:
         config = ClusterConfig.load(args.config)
     else:
         config = ClusterConfig.from_env()
-    for name in ("cluster_name", "location", "resource_group", "subscription_id"):
-        override = getattr(args, name, None)
-        if override:
-            setattr(config, name, override)
-    if getattr(args, "cluster_version", None):
-        config.cluster_version = args.cluster_version
-    if getattr(args, "nodepool_version", None):
-        config.nodepool_version = args.nodepool_version
-    if getattr(args, "backend", None):
-        config.backend = args.backend
-    if getattr(args, "keyvault_private_endpoint", False):
-        config.keyvault_private_endpoint = True
-        # Mirrors __post_init__, which already ran with the config-file value.
-        config.vault_visibility = "Private"
-    return config
+    # with_overrides re-derives every name that came from cluster_name, so
+    # --cluster-name beta cannot leave alpha's vault, VNet and managed group
+    # in the plan.
+    return config.with_overrides(
+        cluster_name=getattr(args, "cluster_name", None) or None,
+        location=getattr(args, "location", None) or None,
+        resource_group=getattr(args, "resource_group", None) or None,
+        subscription_id=getattr(args, "subscription_id", None) or None,
+        cluster_version=getattr(args, "cluster_version", None) or None,
+        nodepool_version=getattr(args, "nodepool_version", None) or None,
+        backend=getattr(args, "backend", None) or None,
+        keyvault_private_endpoint=True if getattr(args, "keyvault_private_endpoint", False) else None,
+    )
 
 
-def _guard_mixed_backends(config: ClusterConfig, state_dir, *, apply: bool) -> None:
-    """Refuse to run Terraform over a cluster the az backend already built.
+def _fingerprint(config: ClusterConfig, *, destroy: bool) -> dict[str, str]:
+    # Terraform reconciles a changed setting itself (a fresh plan runs every
+    # time), so only the target's identity is pinned there; the az-cli
+    # backend has no update path and pins everything a completed step used.
+    if destroy:
+        keys = ("location", "resource_group", "backend")
+    elif config.backend == "terraform":
+        keys = ("location", "resource_group", "managed_resource_group", "backend")
+    else:
+        keys = _FINGERPRINT_KEYS
+    return {key: str(getattr(config, key)) for key in keys}
+
+
+def _completed_steps(path: Path) -> int | None:
+    """Completed steps recorded at ``path``; None when the file is unreadable."""
+    if not path.exists():
+        return 0
+    try:
+        other = RunState.load(path)
+    except StateError:
+        return None
+    return sum(
+        1 for entry in other.steps.values()
+        if entry.get("status") in (state_mod.DONE, state_mod.SKIPPED)
+    )
+
+
+def _guard_mixed_backends(
+    config: ClusterConfig, state_dir, *, apply: bool, destroy: bool, custom_state: str | None = None,
+) -> None:
+    """Refuse to let one backend act on a cluster the other one built.
 
     The two backends name the Key Vault and the managed identities
-    differently, so Terraform would not adopt those resources — it would
-    create a second, overlapping set alongside them.
+    differently: Terraform over an az-built cluster creates a second,
+    overlapping set, and either teardown run against the other's cluster
+    misses resources (and used to delete the other backend's state file,
+    disabling this very guard). An unreadable state file is treated as
+    "may have built something" — failing open is how the guard was bypassed.
     """
-    az_state = default_state_path(config.cluster_name, state_dir)
-    if not az_state.exists():
+    terraform = config.backend == "terraform"
+    other_backend = "az-cli" if terraform else "terraform"
+    suffix = None if terraform else "tf"
+    # The default location, and the directory of a custom --state: a run
+    # that used --state must not slip past the guard.
+    candidates = [default_state_path(config.cluster_name, state_dir, suffix=suffix)]
+    if custom_state:
+        candidates.append(default_state_path(config.cluster_name, Path(custom_state).parent,
+                                             suffix=suffix))
+    other, done = candidates[0], 0
+    for path in candidates:
+        found = _completed_steps(path)
+        if found != 0:
+            other, done = path, found
+            break
+    if done == 0:
         return
-    try:
-        other = RunState.load(az_state)
-    except (ValueError, json.JSONDecodeError):
-        return
-    done = [
-        sid for sid, entry in other.steps.items()
-        if entry.get("status") in (state_mod.DONE, state_mod.SKIPPED)
-    ]
-    if not done:
-        return
+    what = "an unreadable state file" if done is None else f"{done} completed {other_backend} step(s)"
     message = (
-        f"{az_state} records {len(done)} completed az-cli step(s) for "
-        f"{config.cluster_name}.\nThe terraform backend names the Key Vault and "
-        "the managed identities differently, so it cannot adopt those resources "
-        "— it would build a second, overlapping set.\nEither tear the cluster "
-        "down with `aro-hcp destroy -c <config> --apply` first, or use a "
-        "different cluster_name for the terraform run."
+        f"{other} records {what} for {config.cluster_name}.\n"
+        f"The {config.backend} backend names the Key Vault and the managed identities "
+        f"differently, so it cannot {'tear down' if destroy else 'adopt'} what the "
+        f"{other_backend} backend built.\n"
+        f"Use --backend {other_backend} for this cluster, or a different cluster_name."
     )
     if apply:
         raise ConfigError(message)
     _eprint(f"warning: {message}\n")
 
 
+def _state_paths(args: argparse.Namespace, config: ClusterConfig, *, destroy: bool) -> tuple[Path, Path]:
+    """Return (path this run uses, the build state it pairs with)."""
+    terraform = config.backend == "terraform"
+    if args.state:
+        build = Path(args.state)
+    else:
+        build = default_state_path(config.cluster_name, args.state_dir,
+                                   suffix="tf" if terraform else None)
+    return (destroy_state_path(build) if destroy else build), build
+
+
+def _check_writable(path: Path) -> None:
+    """Fail before the first Azure write if progress could not be recorded."""
+    directory = path.parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise ConfigError(f"cannot create state directory {directory}: {exc}") from exc
+    if not os.access(directory, os.W_OK):
+        raise ConfigError(
+            f"state directory {directory} is not writable; progress could not be "
+            "recorded, so nothing was started"
+        )
+
+
 def _setup(
-    args: argparse.Namespace, *, apply: bool, destroy: bool = False
+    args: argparse.Namespace, *, apply: bool, destroy: bool = False, build: bool = True
 ) -> tuple[ClusterConfig, Executor]:
     config = _load_config(args)
-    config.require_valid()
+    # Build-only rules (a private vault needing --keyvault-private-endpoint,
+    # node pool limits, network sizing, a readable pull secret) must never
+    # block a teardown, or a status report.
+    config.require_valid(teardown=destroy or not build)
+
+    terraform = config.backend == "terraform"
+    phases = getattr(args, "phase", None) or []
+    valid = (TERRAFORM_DESTROY_PHASES if destroy else TERRAFORM_PHASES) if terraform \
+        else (DESTROY_PHASES if destroy else PHASES)
+    unknown = [p for p in phases if p not in valid]
+    if unknown:
+        raise ConfigError(
+            f"--phase {', '.join(unknown)} is not a {config.backend} "
+            f"{'teardown ' if destroy else ''}phase; valid: {', '.join(valid)}"
+        )
 
     az = AzCli(config.subscription_id, dry_run=not apply)
     if not config.subscription_id:
         config.subscription_id = az.current_subscription()
         az.subscription = config.subscription_id
 
-    terraform = config.backend == "terraform"
-
     # Each (backend, direction) pair keeps its own state. Teardown must not
     # read or clobber the build run's "already done" marks, and the two
     # backends' step ids and resources have nothing to do with each other.
-    parts = [p for p in ("tf" if terraform else "", "destroy" if destroy else "") if p]
-    suffix = ".".join(parts) or None
-    state_path = Path(args.state) if args.state else default_state_path(
-        config.cluster_name, args.state_dir, suffix=suffix
-    )
+    state_path, _build = _state_paths(args, config, destroy=destroy)
+    if apply:
+        _check_writable(state_path)
     run_state = RunState.load(state_path)
+    if destroy and terraform and not run_state.get(MODULE_COMMIT) and _build.exists():
+        # Tear down with the module commit the build used, not wherever a
+        # branch in terraform_ref points today.
+        try:
+            run_state.set_context(MODULE_COMMIT, RunState.load(_build).get(MODULE_COMMIT))
+        except StateError:
+            pass  # the mixed-backend guard below reports an unreadable file
+
+    _guard_mixed_backends(config, args.state_dir, apply=apply, destroy=destroy,
+                          custom_state=args.state)
 
     runners = None
     if terraform:
-        if not destroy:
-            # Only a build can collide. A teardown that finds nothing in
-            # Terraform state simply deletes nothing.
-            _guard_mixed_backends(config, args.state_dir, apply=apply)
         work_dir = args.state_dir or None
         plan = (
             build_terraform_destroy_plan(config, work_dir) if destroy
@@ -147,10 +247,18 @@ def _setup(
         config, plan, az, run_state,
         apply=apply,
         confirm=confirm,
-        on_event=(lambda msg: print(msg)) if not args.quiet else None,
+        # Progress goes to stderr when stdout carries JSON.
+        on_event=None if args.quiet else (
+            (lambda msg: print(msg, file=sys.stderr, flush=True)) if getattr(args, "json", False)
+            else (lambda msg: print(msg, flush=True))
+        ),
         runners=runners,
+        fingerprint=_fingerprint(config, destroy=destroy),
+        allow_deletes=getattr(args, "allow_deletes", False),
     )
     resolve_signed_in_user(az, run_state)
+    if not destroy:
+        pullsecret.invalidate_if_changed(config, run_state)
     return config, executor
 
 
@@ -215,21 +323,108 @@ def _confirm_apply(executor: Executor, phases) -> bool:
     return input("Proceed? [y/N] ").strip().lower() in ("y", "yes")
 
 
+def _destroy_summary(config: ClusterConfig, executor: Executor) -> None:
+    """What a teardown deletes. Printed with or without the prompt (-y)."""
+    if config.backend == "terraform":
+        scope = "everything Terraform owns, including its Key Vault (purged)"
+    else:
+        scope = (f"the Key Vault {config.keyvault_name} and its etcd encryption key "
+                 "(purged, irreversible), 13 managed identities, the private endpoint "
+                 "and DNS zone if present")
+    print(f"\nThis permanently deletes cluster {config.cluster_name}, {scope}, the VNet, "
+          f"and resource group {config.resource_group} with anything else in it, in "
+          f"subscription {config.subscription_id}.")
+    _warn_foreign_resources(config, executor)
+
+
+def _confirm_destroy(config: ClusterConfig, executor: Executor) -> bool:
+    """Make the operator type the cluster name before anything is deleted.
+
+    Teardown is irreversible and the resource names are the only thing
+    standing between this and the wrong cluster. A y/N is too easy to
+    answer on autopilot.
+    """
+    if not sys.stdin.isatty():
+        _eprint("\nstdin is not a TTY and --yes was not given; declining to delete.")
+        return False
+    _destroy_summary(config, executor)
+    # Exact match: a padded name is a typo, not a confirmation.
+    typed = input(f"Type the cluster name ({config.cluster_name}) to confirm: ")
+    if typed != config.cluster_name:
+        _eprint("Name did not match; nothing was deleted.")
+        return False
+    return True
+
+
+#: Resource types this tool (or ARO, inside the cluster's own resources)
+#: creates in the customer resource group.
+_OWNED_TYPES = {
+    "microsoft.redhatopenshift/hcpopenshiftclusters",
+    "microsoft.network/networksecuritygroups",
+    "microsoft.network/virtualnetworks",
+    "microsoft.managedidentity/userassignedidentities",
+    "microsoft.keyvault/vaults",
+    "microsoft.network/privateendpoints",
+    "microsoft.network/privatednszones",
+    "microsoft.network/privatednszones/virtualnetworklinks",
+    "microsoft.network/networkinterfaces",
+}
+
+
+def _warn_foreign_resources(config: ClusterConfig, executor: Executor) -> None:
+    """List anything in the resource group this tool did not create.
+
+    The last teardown step deletes the whole group, so unrelated resources
+    that share it are deleted too. Say so by name before asking.
+    """
+    result = executor.az.run(
+        ["resource", "list", "--resource-group", config.resource_group,
+         "--query", "[].{name:name, type:type}", "--output", "json"],
+        check=False, force=True,
+    )
+    try:
+        items = result.json() or [] if result.ok else []
+    except ValueError:
+        items = []
+    foreign = [i for i in items if str(i.get("type", "")).lower() not in _OWNED_TYPES]
+    if foreign:
+        print(f"!! {len(foreign)} resource(s) in {config.resource_group} were not created by "
+              "aro-hcp and will be deleted with the group:")
+        for item in foreign[:20]:
+            print(f"     - {item.get('name')} ({item.get('type')})")
+
+
+def _failure_text(outcome) -> str:
+    """The useful part of a failed step's output.
+
+    Terraform and the RP put the actual reason at the end of a long error;
+    a fixed-length prefix used to cut it off.
+    """
+    text = (outcome.message or outcome.stderr or "").strip()
+    if len(text) <= 4000:
+        return text
+    marker = text.rfind("Error:")
+    if marker != -1:
+        return "...\n" + text[marker:][:6000]
+    return "...\n" + text[-4000:]
+
+
 # -- commands ---------------------------------------------------------------
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
     config = _load_config(args)
     problems = config.validate()
+    warnings = config.warnings()
     if args.json:
-        print(json.dumps({"valid": not problems, "problems": problems,
+        print(json.dumps({"valid": not problems, "problems": problems, "warnings": warnings,
                           "config": config.to_dict()}, indent=2, sort_keys=True))
-        return 1 if problems else 0
+        return EXIT_FAILED if problems else EXIT_OK
     if problems:
         print("Configuration is not usable:")
         for problem in problems:
             print(f"  - {problem}")
-        return 1
+        return EXIT_FAILED
     print(f"Configuration for {config.cluster_name} is valid.")
     print(f"  backend:         {config.backend}")
     print(f"  resource group:  {config.resource_group}")
@@ -240,7 +435,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
              else config.keyvault_name)
     print(f"  key vault:       {vault} ({config.vault_visibility})")
     print(f"  api / ingress:   {config.api_visibility} / {config.ingress_visibility}")
-    return 0
+    for warning in warnings:
+        print(f"  warning: {warning}")
+    return EXIT_OK
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -249,7 +446,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     report = run_preflight(az, config, deep=not args.shallow)
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
-        return 1 if report.blocked else 0
+        return EXIT_BLOCKED if report.blocked else EXIT_OK
     for finding in report.findings:
         print(f"[{STATUS_MARK.get(finding.status, finding.status)}] {finding.check}: {finding.message}")
         if finding.remedy:
@@ -257,7 +454,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     print()
     print("BLOCKED — resolve the failures above before applying."
           if report.blocked else "Preflight passed.")
-    return 1 if report.blocked else 0
+    return EXIT_BLOCKED if report.blocked else EXIT_OK
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -265,14 +462,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
     phases = args.phase or None
     if config.backend == "terraform" and not args.json:
         return _terraform_plan(executor, phases)
+    if config.backend == "terraform":
+        return _terraform_plan_json(args, config, executor)
     rows = executor.render_plan(phases)
     if args.json:
-        print(json.dumps([
-            {"id": s.id, "phase": s.phase, "status": st, "description": s.description,
-             "command": cmd, "mutating": s.mutating}
-            for s, st, cmd in rows
-        ], indent=2))
-        return 0
+        print(json.dumps({
+            # On the terraform backend this lists the wrapper's steps; the
+            # resource-level diff is only in the text output of `plan`.
+            "kind": "aro-hcp-steps",
+            "backend": config.backend,
+            "steps": [
+                {"id": s.id, "phase": s.phase, "status": st, "description": s.description,
+                 "command": cmd, "mutating": s.mutating}
+                for s, st, cmd in rows
+            ],
+        }, indent=2))
+        return EXIT_OK
 
     current = None
     writes = 0
@@ -290,7 +495,23 @@ def cmd_plan(args: argparse.Namespace) -> int:
             writes += 1
     print(f"\n{writes} write(s) pending across {len(rows)} step(s).")
     print("Nothing was created. Run `aro-hcp apply` to execute.")
-    return 0
+    return EXIT_OK
+
+
+def _terraform_plan_json(args, config: ClusterConfig, executor: Executor) -> int:
+    """`plan --json` on terraform: the real resource diff, not the wrapper's steps."""
+    outcomes = executor.run_all(["workspace", "init"], stop_on_error=True)
+    failed = [o for o in outcomes if o.status == state_mod.FAILED]
+    if failed:
+        _print_failures(failed)
+        return EXIT_FAILED
+    try:
+        print(json.dumps(plan_json(config, executor.runners["terraform"], args.state_dir or None),
+                         indent=2))
+    except Exception as exc:  # AzError from terraform, reported cleanly
+        _eprint(f"terraform plan failed: {exc}")
+        return EXIT_FAILED
+    return EXIT_OK
 
 
 def _terraform_plan(executor: Executor, phases) -> int:
@@ -307,28 +528,48 @@ def _terraform_plan(executor: Executor, phases) -> int:
     outcomes = executor.run_all(wanted, stop_on_error=True)
     for outcome in outcomes:
         step = outcome.step
-        if outcome.status == state_mod.FAILED:
+        # A dry run reports a failed lookup as pending (the resource may just
+        # not exist yet), but the local terraform steps really run here: a
+        # failed init or plan is a failure, not something to wait for.
+        local_failure = (outcome.status == state_mod.PENDING and step.runner == "terraform"
+                         and not step.mutating)
+        if outcome.status == state_mod.FAILED or local_failure:
             print(f"\nFAILED {step.id}: {step.description}")
             print(f"  {outcome.command}")
-            print(f"  {(outcome.message or outcome.stderr).strip()[:2000]}")
-            return 1
+            print(f"  {_failure_text(outcome)}")
+            return EXIT_FAILED
         if step.id == "tf-plan":
             print(outcome.stdout or outcome.message)
         elif step.mutating and outcome.status == state_mod.PENDING:
             print(f"[hold] {step.id}: {step.description}")
+        elif outcome.status == state_mod.PENDING:
+            # A lookup of something the apply has not created yet.
+            print(f"[wait] {step.id}: {outcome.message or step.description}")
         elif step.action:
             # Actions report one useful line; terraform's own banners do not.
             print(f"[ok  ] {step.id}: {outcome.stdout.strip()}")
         else:
             print(f"[ok  ] {step.id}: {step.description}")
     print("\nNothing was created. Run `aro-hcp apply --backend terraform` to execute.")
-    return 0
+    return EXIT_OK
+
+
+def _print_failures(failed) -> None:
+    for outcome in failed:
+        print(f"\nFAILED {outcome.step.id}: {outcome.step.description}")
+        print(f"  {outcome.command}")
+        print(f"  {_failure_text(outcome)}")
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
     config, executor = _setup(args, apply=True)
+    phases = args.phase or None
 
-    if not args.skip_preflight:
+    if args.skip_preflight:
+        # An override, so it is said out loud and written down.
+        print("warning: --skip-preflight given; environment checks were not run.")
+        executor.state.note("skip-preflight", "operator bypassed preflight")
+    else:
         report = run_preflight(executor.az, config, deep=True)
         for finding in report.findings:
             if finding.status != OK:
@@ -338,44 +579,50 @@ def cmd_apply(args: argparse.Namespace) -> int:
         if report.blocked:
             _eprint("\nPreflight failed. Fix the issues above, or pass --skip-preflight "
                     "to override.")
-            return 1
+            return EXIT_BLOCKED
 
     # After preflight, so nobody is asked to approve a run that cannot start.
     if not args.yes and not args.confirm_each_phase:
-        if not _confirm_apply(executor, args.phase or None):
+        if not _confirm_apply(executor, phases):
             print("Nothing was created.")
-            return 1
+            return EXIT_DECLINED
 
-    outcomes = executor.run_all(args.phase or None, stop_on_error=not args.keep_going)
-    executor.state.save()
+    with executor.state.lock():
+        outcomes = executor.run_all(phases, stop_on_error=not args.keep_going)
+        executor.state.save()
 
     failed = [o for o in outcomes if o.status == state_mod.FAILED]
-    created = [o for o in outcomes if o.status == state_mod.DONE]
+    created = [o for o in outcomes if o.status == state_mod.DONE and o.step.mutating]
     skipped = [o for o in outcomes if o.status == state_mod.SKIPPED]
-    print(f"\n{len(created)} executed, {len(skipped)} already present, {len(failed)} failed.")
+    print(f"\n{len(created)} executed, {len(skipped)} already present or verified, "
+          f"{len(failed)} failed.")
     print(f"State: {executor.state.path}")
-    for outcome in failed:
-        print(f"\nFAILED {outcome.step.id}: {outcome.step.description}")
-        print(f"  {outcome.command}")
-        print(f"  {outcome.message.strip()[:1500]}")
+    _print_failures(failed)
     if failed:
-        print("\nFix the cause and re-run `aro-hcp apply` — completed steps are skipped.")
-        return 1
+        print("\nFix the cause and re-run `aro-hcp apply` — completed steps are re-verified "
+              "and skipped.")
+        return EXIT_FAILED
+    if executor.declined:
+        print("\nDeclined; the remaining phases were not run.")
+        return EXIT_DECLINED
 
-    pending = executor.pending()
+    pending = executor.pending(phases)
     if pending:
         print(f"{len(pending)} step(s) still pending; re-run apply to continue.")
-        return 1
+        return EXIT_INCOMPLETE
+    if phases:
+        print(f"\nPhase(s) {', '.join(phases)} of {config.cluster_name} complete.")
+        return EXIT_OK
     print(f"\nCluster {config.cluster_name} provisioned.")
-    return 0
+    return EXIT_OK
 
 
 def cmd_destroy(args: argparse.Namespace) -> int:
     config, executor = _setup(args, apply=args.apply, destroy=True)
     rows = executor.render_plan(args.phase or None)
 
-    print(f"Teardown plan for {config.cluster_name} "
-          f"(resource group {config.resource_group}, subscription {config.subscription_id}):\n")
+    print(f"Teardown plan for {config.cluster_name} ({config.backend} backend; "
+          f"resource group {config.resource_group}, subscription {config.subscription_id}):\n")
     current = None
     for step, status, command in rows:
         if step.phase != current:
@@ -387,81 +634,129 @@ def cmd_destroy(args: argparse.Namespace) -> int:
 
     if not args.apply:
         print("\nNothing was deleted. Re-run with --apply to execute.")
-        return 0
+        return EXIT_OK
 
-    # Teardown is irreversible and the resource names are the only thing
-    # standing between this and the wrong cluster, so make the operator type
-    # one. A phase-level y/N is too easy to answer on autopilot.
-    if not args.yes:
-        if not sys.stdin.isatty():
-            _eprint("\nstdin is not a TTY and --yes was not given; declining to delete.")
-            return 1
-        identities = "everything Terraform owns" if config.backend == "terraform" \
-            else "13 managed identities"
-        print(f"\nThis permanently deletes the cluster, the Key Vault and its etcd "
-              f"encryption key, {identities}, the VNet, and the resource "
-              f"group {config.resource_group}.")
-        typed = input(f"Type the cluster name ({config.cluster_name}) to confirm: ").strip()
-        if typed != config.cluster_name:
-            _eprint("Name did not match; nothing was deleted.")
-            return 1
+    if args.yes:
+        _destroy_summary(config, executor)
+    elif not _confirm_destroy(config, executor):
+        return EXIT_DECLINED
 
-    outcomes = executor.run_all(args.phase or None, stop_on_error=not args.keep_going)
-    executor.state.save()
+    with executor.state.lock():
+        outcomes = executor.run_all(args.phase or None, stop_on_error=not args.keep_going)
+        executor.state.save()
 
     failed = [o for o in outcomes if o.status == state_mod.FAILED]
-    deleted = [o for o in outcomes if o.status == state_mod.DONE]
-    gone = [o for o in outcomes if o.status == state_mod.SKIPPED]
+    # Only steps that delete something count as deletions; fetching the
+    # module or running init is bookkeeping.
+    deleted = [o for o in outcomes if o.status == state_mod.DONE and o.step.deletes
+               and "bookkeeping" not in o.step.tags]
+    gone = [o for o in outcomes if o.status == state_mod.SKIPPED and o.step.deletes
+            and "bookkeeping" not in o.step.tags]
     print(f"\n{len(deleted)} deleted, {len(gone)} already gone, {len(failed)} failed.")
-    for outcome in failed:
-        print(f"\nFAILED {outcome.step.id}: {outcome.step.description}")
-        print(f"  {outcome.command}")
-        print(f"  {outcome.message.strip()[:1500]}")
+    _print_failures(failed)
     if failed:
         print("\nFix the cause and re-run `aro-hcp destroy --apply` — "
               "resources already gone are skipped.")
-        return 1
+        return EXIT_FAILED
+    if executor.halted:
+        print("\nA delete is still in progress; re-run `aro-hcp destroy --apply` when it finishes.")
+        return EXIT_INCOMPLETE
+    if executor.declined:
+        # Nothing failed, but the declined phases still exist: keep both state
+        # files so the next teardown knows what is left.
+        print("\nTeardown stopped at your request; the remaining resources still exist. "
+              "Re-run `aro-hcp destroy --apply` to continue.")
+        return EXIT_DECLINED
+    if args.phase:
+        return EXIT_OK
+    pending = executor.pending()
+    if pending:
+        # The state files are the only record of what is left; they are
+        # retired on positive evidence that every step finished, not on the
+        # absence of a failure.
+        print(f"\n{len(pending)} teardown step(s) did not complete "
+              f"({', '.join(s.id for s in pending[:5])}); re-run `aro-hcp destroy --apply`.")
+        return EXIT_INCOMPLETE
 
-    # The build state now describes resources that no longer exist; leaving it
-    # would make the next `apply` skip steps it needs to run.
-    build_state = default_state_path(config.cluster_name, args.state_dir)
-    if not args.phase and build_state.exists():
+    # The teardown is complete, so both records of this lifecycle go: the
+    # build state describes resources that no longer exist (the next apply
+    # would skip steps it needs), and the teardown state's "done" marks would
+    # make the next lifecycle's teardown skip a cluster that exists again.
+    _, build_state = _state_paths(args, config, destroy=False)
+    if build_state.exists():
         build_state.unlink()
         print(f"Removed stale build state {build_state}")
+    executor.state.delete()
     print(f"\nTeardown of {config.cluster_name} complete.")
-    return 0
+    return EXIT_OK
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    config, executor = _setup(args, apply=False)
+    config, executor = _setup(args, apply=False, build=False)
     summary = executor.state.summary()
+    failed = {sid: executor.state.steps[sid].get("detail", "")
+              for sid in executor.state.steps
+              if executor.state.status(sid) == state_mod.FAILED}
     if args.json:
         print(json.dumps({
             "cluster": config.cluster_name,
+            "backend": config.backend,
             "state_file": str(executor.state.path),
+            # What this tool recorded, not a live query of Azure.
+            "source": "local state snapshot",
             "summary": summary,
+            "failed": failed,
             "context": executor.context,
             "pending": [s.id for s in executor.pending()],
         }, indent=2, sort_keys=True))
-        return 0
-    print(f"Cluster:    {config.cluster_name}")
+        return EXIT_OK
+    print(f"Cluster:    {config.cluster_name} ({config.backend} backend)")
     print(f"State file: {executor.state.path}"
           f"{'' if executor.state.path.exists() else ' (not created yet)'}")
+    print("            (a local record of what aro-hcp did, not a live check of Azure)")
     print(f"Steps:      {summary[state_mod.DONE]} done, {summary[state_mod.SKIPPED]} skipped, "
           f"{summary[state_mod.FAILED]} failed, {len(executor.pending())} pending")
     if executor.context.get("CLUSTER_PROVISIONING_STATE"):
-        print(f"Cluster state: {executor.context['CLUSTER_PROVISIONING_STATE']}")
-    failed = [sid for sid in executor.state.steps
-              if executor.state.status(sid) == state_mod.FAILED]
-    for sid in failed:
-        print(f"  FAILED {sid}: {executor.state.steps[sid].get('detail', '')[:300]}")
-    return 0
+        print(f"Cluster state when last read: {executor.context['CLUSTER_PROVISIONING_STATE']}")
+    for sid, detail in failed.items():
+        print(f"  FAILED {sid}: {detail[:300]}")
+    return EXIT_OK
 
 
 def cmd_agent(args: argparse.Namespace) -> int:
     from .agent import run_agent
 
+    # The SDK is an optional extra, so this is a routine install state rather
+    # than a bug — say which extra, not just which module is missing.
+    if importlib.util.find_spec("anthropic") is None:
+        _eprint("agent mode needs the Anthropic SDK, which is an optional extra.\n"
+                "  uv tool install 'git+https://github.com/kumuduh/aro-hcp-agent[agent]'\n"
+                "  (or `uv sync --extra agent` in a clone)\n"
+                "Every other subcommand works without it.")
+        return EXIT_USAGE
+
     config, executor = _setup(args, apply=args.apply, destroy=args.destroy)
+
+    # The model is not a safety gate. A live agent run passes the same
+    # deterministic checks as the equivalent CLI command before it starts.
+    if args.apply:
+        if args.destroy:
+            if args.yes:
+                _destroy_summary(config, executor)
+            elif not _confirm_destroy(config, executor):
+                return EXIT_DECLINED
+        else:
+            report = run_preflight(executor.az, config, deep=True)
+            if report.blocked:
+                for finding in report.findings:
+                    if finding.blocking:
+                        print(f"[FAIL] {finding.check}: {finding.message}")
+                _eprint("\nPreflight failed; the agent was not started.")
+                return EXIT_BLOCKED
+            if not args.yes and not _confirm_apply(executor, None):
+                print("Nothing was created.")
+                return EXIT_DECLINED
+
     if args.destroy:
         default = ("Tear down this cluster and everything created with it."
                    if args.apply
@@ -473,39 +768,62 @@ def cmd_agent(args: argparse.Namespace) -> int:
                    else "Review the plan for this cluster and report what would be "
                         "created and any risks you find.")
     instruction = args.instruction or default
-    # The SDK is an optional extra, so this is a routine install state rather
-    # than a bug — say which extra, not just which module is missing.
-    if importlib.util.find_spec("anthropic") is None:
-        _eprint("agent mode needs the Anthropic SDK, which is an optional extra.\n"
-                "  uv tool install 'git+https://github.com/kumuduh/aro-hcp-agent[agent]'\n"
-                "  (or `uv sync --extra agent` in a clone)\n"
-                "Every other subcommand works without it.")
-        return 1
     try:
-        result = run_agent(
-            executor, config, instruction,
-            model=args.model,
-            max_turns=args.max_turns,
-            destroy=args.destroy,
-            on_text=lambda text: print(text, flush=True),
-        )
+        if args.apply:
+            with executor.state.lock():
+                result = _run_agent(run_agent, executor, config, instruction, args)
+        else:
+            result = _run_agent(run_agent, executor, config, instruction, args)
+    except state_mod.StateLocked:
+        raise
     except Exception as exc:  # surfaced rather than a traceback
         _eprint(f"agent error: {type(exc).__name__}: {exc}")
         if executor.persist:
             executor.state.save()
-        return 1
+        return EXIT_FAILED
     if executor.persist:
         executor.state.save()
+
+    stop = getattr(result, "stop_reason", None)
     if args.quiet:
         print(result.text)
-    return 0 if result.stop_reason != "refusal" else 1
+    if stop == "refusal":
+        return EXIT_FAILED
+    # The model saying "done" is not the oracle; the plan's state is.
+    if getattr(result, "hit_turn_limit", False) or stop != "end_turn":
+        _eprint(f"\nagent stopped before finishing ({stop or 'turn limit'}).")
+        return EXIT_INCOMPLETE
+    if args.apply:
+        failed = [s for s in executor.plan if executor.state.status(s.id) == state_mod.FAILED]
+        if failed:
+            _eprint(f"\n{len(failed)} step(s) failed: {', '.join(s.id for s in failed[:10])}")
+            return EXIT_FAILED
+        pending = executor.pending()
+        if pending:
+            _eprint(f"\n{len(pending)} step(s) still pending.")
+            return EXIT_INCOMPLETE
+        if args.destroy:
+            _, build_state = _state_paths(args, config, destroy=False)
+            build_state.unlink(missing_ok=True)
+            executor.state.delete()
+    return EXIT_OK
+
+
+def _run_agent(run_agent, executor, config, instruction, args):
+    return run_agent(
+        executor, config, instruction,
+        model=args.model,
+        max_turns=args.max_turns,
+        destroy=args.destroy,
+        on_text=None if args.quiet else (lambda text: print(text, flush=True)),
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
     path = Path(args.output)
     if path.exists() and not args.force:
         _eprint(f"{path} already exists; pass --force to overwrite.")
-        return 1
+        return EXIT_USAGE
     template = """\
 # ARO HCP cluster configuration.
 # Docs: https://learn.microsoft.com/azure/openshift/howto-create-custom-hosted-cluster
@@ -515,6 +833,7 @@ cluster_name: my-hcp-cluster
 # `aro-hcp preflight` lists the current set if this one is not supported.
 location: eastus2
 resource_group: my-hcp-rg
+# Quote versions: YAML reads an unquoted 4.20 as the number 4.2.
 cluster_version: "4.22"
 nodepool_version: "4.22.1"
 
@@ -535,24 +854,43 @@ backend: az-cli
 # vnet_integration_subnet_name: vnet-integration-subnet
 # managed_resource_group: my-hcp-cluster-managed-rg
 
+# IPv4 only. The integration subnet must be /28 or larger, the worker subnet
+# /24 or larger, and neither may overlap 10.128.0.0/14 or 172.30.0.0/16.
 vnet_address_prefix: 10.0.0.0/16
 worker_subnet_prefix: 10.0.0.0/24
 vnet_integration_subnet_prefix: 10.0.1.0/24
 
 api_visibility: Public        # Public | Private
 ingress_visibility: Public    # Public | Private
-vault_visibility: Public      # Public | Private — must match the Key Vault network config
+# Private requires --keyvault-private-endpoint (az-cli backend only).
+vault_visibility: Public      # Public | Private
 
 nodepool_name: np-1
 nodepool_replicas: 2
 nodepool_vm_size: Standard_D8s_v6
+
+# A Red Hat pull secret, so the cluster can pull Red Hat images and
+# OperatorHub content. Added as kube-system/additional-pull-secret; needs `oc`
+# or `kubectl`. Relative paths are relative to this file. Never commit it.
+# pull_secret_path: ./pull-secret.json
 """
-    path.write_text(template)
+    try:
+        path.write_text(template)
+    except OSError as exc:
+        _eprint(f"cannot write {path}: {exc}")
+        return EXIT_USAGE
     print(f"Wrote {path}. Edit it, then run: aro-hcp plan --config {path}")
-    return 0
+    return EXIT_OK
 
 
 # -- parser -----------------------------------------------------------------
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return number
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -560,79 +898,95 @@ def build_parser() -> argparse.ArgumentParser:
         prog="aro-hcp",
         description="Provision an Azure Red Hat OpenShift cluster with hosted control "
                     "planes, following the Microsoft Learn az CLI procedure.",
+        epilog="Exit codes: 0 ok, 1 a step failed, 2 usage/config/state error, "
+               "3 declined, 4 preflight blocked, 5 incomplete, 130 interrupted.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common(p: argparse.ArgumentParser, *, state: bool = True) -> None:
-        p.add_argument("-c", "--config", help="path to a YAML or JSON cluster config")
-        p.add_argument("--cluster-name")
-        p.add_argument("--location")
-        p.add_argument("--resource-group")
-        p.add_argument("--subscription-id")
-        p.add_argument("--cluster-version")
-        p.add_argument("--nodepool-version")
+        p.add_argument("-c", "--config", help="path to a YAML or JSON cluster config "
+                       "(default: ARO_* environment variables)")
+        p.add_argument("--cluster-name", help="override cluster_name; derived names follow it")
+        p.add_argument("--location", help="override location (Azure region short name)")
+        p.add_argument("--resource-group", help="override resource_group")
+        p.add_argument("--subscription-id", help="override subscription_id "
+                       "(default: the active az subscription)")
+        p.add_argument("--cluster-version", help="override cluster_version (major.minor)")
+        p.add_argument("--nodepool-version", help="override nodepool_version (major.minor.patch)")
         p.add_argument("--backend", choices=BACKENDS,
                        help="how to provision: the az CLI procedure, or the "
                             "upstream Terraform module (default: az-cli)")
         p.add_argument("--keyvault-private-endpoint", action="store_true",
                        help="put the Key Vault behind a private endpoint "
                             "(az-cli backend only)")
-        p.add_argument("-q", "--quiet", action="store_true")
+        p.add_argument("-q", "--quiet", action="store_true", help="print only the result")
         if state:
-            p.add_argument("--state", help="path to the run state file")
-            p.add_argument("--state-dir", help="directory for the default state file")
+            p.add_argument("--state", help="path to the build state file (teardown uses "
+                           "a paired .destroy file next to it)")
+            p.add_argument("--state-dir", help="directory for state files and the terraform "
+                           "work directory (default: ./.aro-hcp)")
             p.add_argument("-y", "--yes", action="store_true",
                            help="do not prompt for confirmation at all")
             p.add_argument("--confirm-each-phase", action="store_true",
                            help="ask before every phase instead of once up front")
 
     p_init = sub.add_parser("init", help="write a starter config file")
-    p_init.add_argument("-o", "--output", default="cluster.yaml")
-    p_init.add_argument("--force", action="store_true")
+    p_init.add_argument("-o", "--output", default="cluster.yaml", help="file to write")
+    p_init.add_argument("--force", action="store_true", help="overwrite an existing file")
     p_init.set_defaults(func=cmd_init)
 
     p_validate = sub.add_parser("validate", help="validate the configuration offline")
     add_common(p_validate, state=False)
-    p_validate.add_argument("--json", action="store_true")
+    p_validate.add_argument("--json", action="store_true", help="machine-readable output")
     p_validate.set_defaults(func=cmd_validate)
 
     p_pre = sub.add_parser("preflight", help="check the Azure environment")
     add_common(p_pre, state=False)
     p_pre.add_argument("--shallow", action="store_true",
                        help="skip checks that call Azure")
-    p_pre.add_argument("--json", action="store_true")
+    p_pre.add_argument("--json", action="store_true", help="machine-readable output")
     p_pre.set_defaults(func=cmd_preflight)
 
     p_plan = sub.add_parser("plan", help="render every command without running it")
     add_common(p_plan)
-    p_plan.add_argument("--phase", action="append", choices=ALL_PHASES)
+    p_plan.add_argument("--phase", action="append", choices=ALL_PHASES,
+                        help="limit to a phase of the selected backend (repeatable)")
     p_plan.add_argument("-v", "--verbose", action="store_true",
                         help="print the full az command for each step")
-    p_plan.add_argument("--json", action="store_true")
+    p_plan.add_argument("--json", action="store_true",
+                        help="machine-readable list of the wrapper's steps")
     p_plan.set_defaults(func=cmd_plan)
 
     p_apply = sub.add_parser("apply", help="create the cluster")
     add_common(p_apply)
-    p_apply.add_argument("--phase", action="append", choices=ALL_PHASES)
-    p_apply.add_argument("--skip-preflight", action="store_true")
+    p_apply.add_argument("--phase", action="append", choices=ALL_PHASES,
+                         help="run only this phase of the selected backend (repeatable)")
+    p_apply.add_argument("--skip-preflight", action="store_true",
+                         help="run without environment checks (recorded in state)")
+    p_apply.add_argument("--allow-deletes", action="store_true",
+                         help="terraform backend: apply even if the fresh plan deletes or "
+                         "replaces resources (refused by default)")
     p_apply.add_argument("--keep-going", action="store_true",
-                         help="continue to the next step after a failure")
+                         help="continue past a failure to steps that do not depend on it")
     p_apply.set_defaults(func=cmd_apply)
 
     p_destroy = sub.add_parser(
         "destroy", help="delete everything this tool created, including the cluster")
     add_common(p_destroy)
-    p_destroy.add_argument("--phase", action="append", choices=ALL_DESTROY_PHASES)
+    p_destroy.add_argument("--phase", action="append", choices=ALL_DESTROY_PHASES,
+                           help="run only this teardown phase (its prerequisites are "
+                                "still enforced)")
     p_destroy.add_argument("--apply", action="store_true",
                            help="actually delete (default: show the teardown plan)")
-    p_destroy.add_argument("-v", "--verbose", action="store_true")
+    p_destroy.add_argument("-v", "--verbose", action="store_true",
+                           help="print the full command for each step")
     p_destroy.add_argument("--keep-going", action="store_true",
-                           help="continue to the next step after a failure")
+                           help="continue past a failure to steps that do not depend on it")
     p_destroy.set_defaults(func=cmd_destroy)
 
     p_status = sub.add_parser("status", help="show progress from the state file")
     add_common(p_status)
-    p_status.add_argument("--json", action="store_true")
+    p_status.add_argument("--json", action="store_true", help="machine-readable output")
     p_status.set_defaults(func=cmd_status)
 
     p_agent = sub.add_parser("agent", help="let Claude drive the plan")
@@ -640,11 +994,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("instruction", nargs="?",
                          help="what you want the agent to do")
     p_agent.add_argument("--apply", action="store_true",
-                         help="allow the agent to create or delete (default: plan only)")
+                         help="allow the agent to create or delete (default: plan only); "
+                              "the same confirmation as apply/destroy is required")
     p_agent.add_argument("--destroy", action="store_true",
                          help="drive the teardown plan instead of the build plan")
-    p_agent.add_argument("--model", default="claude-opus-5")
-    p_agent.add_argument("--max-turns", type=int, default=80)
+    p_agent.add_argument("--model", default=os.environ.get("ARO_HCP_MODEL", "claude-opus-5"),
+                         help="Claude model id (default: $ARO_HCP_MODEL or claude-opus-5)")
+    p_agent.add_argument("--max-turns", type=_positive_int, default=80,
+                         help="stop after this many model turns (default 80)")
     p_agent.set_defaults(func=cmd_agent)
 
     return parser
@@ -655,15 +1012,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except ConfigError as exc:
+    except (ConfigError, StateError, AzNotFound) as exc:
         _eprint(str(exc))
-        return 2
-    except AzNotFound as exc:
-        _eprint(str(exc))
-        return 2
+        return EXIT_USAGE
     except KeyboardInterrupt:
         _eprint("\ninterrupted; re-run the same command to resume")
-        return 130
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

@@ -61,10 +61,22 @@ eight times is a prompt you stop reading. Pass `-y` for unattended runs, or
 
 ### Resuming
 
-Every step records its outcome in `.aro-hcp/<cluster>.state.json`, and every
-step checks whether its resource already exists before creating it. After a
-failure, fix the cause and re-run the same `apply` — completed steps are
-skipped. The same property makes it safe to point at a partially built cluster.
+Every step records its outcome in `.aro-hcp/<cluster>.state.json` as it
+finishes, and every step checks whether its resource already exists before
+creating it. After a failure, fix the cause and re-run the same `apply`.
+Completed steps are re-checked against Azure rather than trusted: one whose
+resource has disappeared is redone, and a cluster or node pool only counts
+once its provisioning state is `Succeeded`. One still `Provisioning` stops the
+run with "re-run apply when the operation finishes" (exit 5) instead of being
+reported as provisioned. An existence check that fails for any reason other
+than "not found" (403, throttling, timeout) stops the step; it is never read as
+"absent".
+
+The state file is bound to its cluster, subscription and the settings it was
+built with. Pointing `--state` at another cluster's file, or changing the
+region, network prefixes, versions or node pool after a partial build, is
+refused rather than resumed. Two runs against the same state file cannot
+overlap: the second fails immediately.
 
 ## Backends
 
@@ -77,7 +89,7 @@ Two ways to build the same cluster from the same `cluster.yaml`. Pick one with
 | Extra tooling | none | `terraform` ≥ 1.9 and `git` |
 | Resume | per step, from `.aro-hcp/<cluster>.state.json` | per step, plus Terraform's own state |
 | Preview | the exact commands it would run | a real `terraform plan` diff |
-| Drift detection | no | yes |
+| Drift detection | no — re-apply re-checks each resource exists | yes — every `plan`/`apply` runs a fresh `terraform plan` |
 
 ```bash
 aro-hcp plan    -c cluster.yaml --backend terraform  # real diff, creates nothing
@@ -90,19 +102,70 @@ differently — the Key Vault is `<cluster>-kv` under `az-cli` and
 `cust-kv-<random>` under Terraform, and the identities differ too
 (`<cluster>-cp-cluster-api-azure` versus `<cluster>-cluster-api-azure`). Terraform
 cannot adopt what the az path built; it would create a second, overlapping set.
-`apply --backend terraform` refuses outright when the az state file shows
-completed steps for that cluster.
+Either backend refuses to build or tear down a cluster whose state file under
+the *other* backend shows completed steps — and an unreadable state file counts
+as "may have built something".
+
+The footprints also differ beyond names, at the pinned module ref:
+
+| | `az-cli` | `terraform` |
+|---|---|---|
+| Managed identities | 13 | 13, plus an `eso` identity with Key Vault Secrets User |
+| Deployer's vault role | Key Vault Crypto Officer | Key Vault Administrator |
+| etcd key name | `etcd-kms-key` | `etcd-data-kms-encryption-key` |
+| Private Key Vault | `--keyvault-private-endpoint` | not supported (the module forces public network access) |
+| Node pools | `skip_nodepool`, replicas ≥ 1 | at least one pool, replicas ≥ 2 |
 
 The module is **cloned at a pinned ref** into `.aro-hcp/terraform-src/` rather
 than vendored here, because the upstream repository ships no LICENSE file. Set
 `terraform_dir:` to use your own checkout instead. Each cluster gets its own
 `TF_DATA_DIR` and state file, so one checkout can back several.
 
-Three upstream defaults are pinned in the generated tfvars to keep the two
+Two upstream defaults are pinned in the generated tfvars to keep the two
 backends comparable: `enable_external_auth = false` (upstream defaults *true*
-and registers an Entra application, which the az path never does),
-`enable_jumpbox = false`, and `pull_secret_path = ""`. The generated file says
-so inline.
+and registers an Entra application, which the az path never does) and
+`enable_jumpbox = false`. The generated file says so inline. `pull_secret_path`
+follows the config key of the same name (see [Pull secret](#pull-secret)).
+
+**Missing role assignments in the pinned module (D31).** At the pinned ref the
+module grants `dp-file-csi-driver` its File Storage Operator role on the worker
+subnet only, and grants `dp-image-registry` nothing; the ARO HCP resource
+provider now validates both on the VNet and rejects the cluster
+(`MissingRequiredPermissions`). Until upstream fixes it, `apply` runs Terraform
+in two stages: `-target=module.network -target=module.identities` first, then
+two `az role assignment create` steps for the missing VNet grants, then the full
+apply. The steps are tagged `d31-workaround`; set
+`aro_hcp.terraform.D31_ROLE_WORKAROUND = False` once the module is fixed.
+
+Terraform runs with a filtered environment: `TF_CLI_ARGS*` and `TF_VAR_*` are
+not passed through, and a module directory containing `*.auto.tfvars` or
+`terraform.tfvars` is refused, so nothing outside `cluster.yaml` can change what
+is applied. The checkout must be exactly the pinned commit and clean.
+
+**Apply re-plans, so it refuses deletions.** `apply` runs a fresh `terraform
+plan` and then `terraform apply -auto-approve`, rather than applying a saved
+plan: the D31 two-stage apply and resumed runs would make a saved plan stale.
+The cost is that nobody reviews what the apply runs, so if the fresh plan
+deletes or replaces anything (drift, a moved module), apply stops and lists the
+resources. Review them with `aro-hcp plan --backend terraform -v`, then re-run
+with `--allow-deletes` if they are intended. `--confirm-each-phase` also gives a
+pause between the printed plan and the apply. Both apply steps require the
+plan to have passed in the same run, so neither `--keep-going` nor
+`--phase apply` on its own can skip the check (use `--phase plan --phase apply`).
+
+**`terraform_ref` and moving refs.** The default is a full commit SHA. A branch
+or tag also works, and is resolved afresh on every run, so state records the
+commit a cluster was built from. If the branch or tag later resolves to another
+commit, `apply` refuses and names both commits: pin `terraform_ref` to the
+recorded one to keep the module the cluster was built with, or to the new SHA
+to move deliberately. `destroy` always checks out the recorded commit, so a
+moved branch or a newer default pin never changes what tears a cluster down.
+
+**Tags enforced by Azure Policy.** Because every `plan` and `apply` runs a fresh
+`terraform plan`, tags that a subscription policy adds or inherits (`owner`,
+`cost-center`, …) show up as drift, and an apply would strip them on every run.
+List those tags under `tags:` in `cluster.yaml` so the configuration matches
+what the policy enforces; the plan is then clean.
 
 Teardown removes the node pools from Terraform state before destroying.
 OCPBUGS-86702: the resource provider rejects `DELETE` of a cluster's last node
@@ -112,7 +175,7 @@ fails. ARM cascades the pools when the cluster goes.
 ## Phases
 
 With the `terraform` backend: `workspace` → `init` → `plan` → `apply` →
-`outputs`, and for teardown `workspace` → `init` → `nodepool-state` →
+`outputs` → `pull-secret`, and for teardown `workspace` → `init` → `nodepool-state` →
 `destroy`. With the default `az-cli` backend:
 
 | Phase | What it creates |
@@ -121,10 +184,11 @@ With the `terraform` backend: `workspace` → `init` → `plan` → `apply` →
 | `resource-group` | The customer resource group |
 | `network` | NSG, VNet, worker subnet, VNet integration subnet with the `hcpOpenShiftClusters` delegation |
 | `identities` | 8 control-plane + 3 data-plane + service + KMS managed identities |
-| `role-assignments` | 29 assignments across the VNet, NSG, and the identities |
-| `etcd-encryption` | Key Vault (RBAC), RSA-2048 KMS key, Crypto Officer/User grants, optional private endpoint |
+| `role-assignments` | 27 assignments across the VNet, NSG, and the identities |
+| `etcd-encryption` | Key Vault (RBAC), RSA-2048 KMS key, Crypto Officer/User grants (the other 2 of the 29), optional private endpoint |
 | `cluster` | `az aro hcp cluster create` — 15–20 minutes, billable |
 | `nodepool` | `az aro hcp cluster nodepool create` |
+| `pull-secret` | Only with `pull_secret_path`: `kube-system/additional-pull-secret` in the cluster |
 
 Run one phase at a time with `--phase network`.
 
@@ -136,8 +200,15 @@ aro-hcp destroy -c cluster.yaml --apply  # delete
 ```
 
 `destroy` reverses the build plan in dependency order: cluster → managed
-resource group → Key Vault (delete, then **purge**) → 13 identities → VNet →
-NSG → resource group. Resource providers are never unregistered.
+resource group → Key Vault (delete, then **purge**) → 13 identities → Key Vault
+private endpoint and private DNS link/zone (if present) → VNet → NSG → resource
+group. Resource providers are never unregistered.
+
+The order is enforced per step, not just by phase order: nothing after the
+cluster — the KMS vault, the identities, the network — runs until the cluster
+is confirmed gone, so neither `--phase etcd-encryption` nor `--keep-going` past a
+failed cluster delete can destroy the encryption key under a running control
+plane. Every delete is confirmed against Azure before it counts.
 
 Node pools are the one thing it does not delete. OCPBUGS-86702: the resource
 provider rejects `DELETE` of a cluster's last node pool, and this tool only
@@ -153,10 +224,16 @@ Three gates, because this is irreversible:
    automation.
 3. Non-interactive runs without `-y` decline rather than guess.
 
-It keeps its own state file (`<cluster>.destroy.state.json`) so it never reads
-or clobbers the build run's, and each step probes first — a resource that is
-already gone is skipped, so a failed teardown resumes cleanly. On success the
-stale build state is removed so a later `apply` starts fresh.
+It keeps its own state file (`<cluster>.destroy.state.json`, or
+`<name>.destroy.state.json` next to a custom `--state`) so it never reads or
+clobbers the build run's, and each step probes first — a resource that is
+already gone is skipped, so a failed teardown resumes cleanly. On success both
+files are removed: the build state so a later `apply` starts fresh, and the
+teardown state so a later teardown of a rebuilt cluster does real work.
+
+Before asking for the cluster name, the confirmation lists anything in the
+resource group that aro-hcp did not create — the final step deletes the whole
+group, and those resources with it.
 
 The Key Vault purge matters: soft delete outlives the resource group and keeps
 the vault name reserved, so skipping it makes recreating the same cluster fail.
@@ -166,13 +243,25 @@ the vault name reserved, so skipping it makes recreating the same cluster fail.
 Catches the failures that otherwise surface late:
 
 - az CLI version and the `aro` extension's `hcp` command group
-- Azure sign-in and the signed-in principal (needed for the Crypto Officer grant)
+- Azure sign-in and the signed-in principal's object id (needed for the
+  Crypto Officer grant). Users, service principals and managed identities
+  (`az login --identity`) all work; the object id is read from the access
+  token, so no Microsoft Graph permission is needed
+- **rights to create role assignments** (Owner, User Access Administrator, or
+  Role Based Access Control Administrator) — otherwise apply would create the
+  network and 13 identities and then fail
 - resource provider registration
-- VM core quota in the node pool's family (ARO HCP needs 20+)
+- VM core quota: `replicas × vCPUs` (at least 20) against both the VM family
+  and the regional total, and the VM size's availability in the region
+- Key Vault name availability, including a soft-deleted vault holding the name
 - **region availability** — ARO HCP is preview and regional; the check reads the
   live region list out of the service's own error rather than a hardcoded list
-- cluster and node pool version availability, including channel group
-- name collisions, including a stale managed resource group
+- cluster and node pool version availability, each in its channel group; an
+  empty version list is reported as a probable permissions gap, not as
+  "version not offered"
+- name collisions, including a stale managed resource group, a cluster left in
+  `Failed`, and an existing VNet whose address space does not fit the config.
+  A lookup that cannot be completed is a warning, never a silent pass
 - with `--backend terraform`, the `terraform` version against the module's
   `required_version`, and `git` when a checkout has to be fetched
 
@@ -197,6 +286,7 @@ Notable optional keys:
 | `api_visibility` / `ingress_visibility` | `Public` | `Public` or `Private` |
 | `nodepool_replicas` / `nodepool_vm_size` | `2` / `Standard_D8s_v6` | |
 | `skip_nodepool` | `false` | Cluster only |
+| `pull_secret_path` | *(none)* | A Red Hat pull secret; see [Pull secret](#pull-secret) |
 
 The Key Vault name, the KMS key name, and the private endpoint are **not**
 config keys. The first two are derived, and Terraform names the vault itself;
@@ -205,12 +295,75 @@ adds the private endpoint and DNS steps and forces `vault_visibility: Private`).
 Setting any of them in the file is an error that names the replacement, rather
 than a silently ignored line.
 
-Validation is strict and offline: subnet prefixes must sit inside the VNet and
-not overlap, the node pool version must be in the cluster's minor stream, the
-managed resource group must differ from the customer one, and Key Vault names
-must satisfy Azure's global naming rules.
+Validation is strict and offline:
+
+- Values must have the right type. **Quote versions** — YAML reads an unquoted
+  `4.20` as the number `4.2`. Booleans must be `true`/`false`, not `"false"`;
+  `nodepool_replicas` must be an integer; `tags` a flat string map.
+- IPv4 only. Subnet prefixes must sit inside the VNet and not overlap; the VNet
+  must not overlap the cluster's default pod (`10.128.0.0/14`) or service
+  (`172.30.0.0/16`) ranges. The integration subnet must be **/28 or larger**
+  (Microsoft's requirement); the worker subnet /24 or larger (a constraint of
+  this tool, leaving room to scale).
+- The node pool version must be in the cluster's minor stream, the managed
+  resource group must differ from the customer one (case-insensitively), and
+  every resource name must satisfy Azure's naming rules.
+- `vault_visibility: Private` requires `--keyvault-private-endpoint`; a Private
+  setting on a public vault made the cluster create hang.
+- On the terraform backend, `skip_nodepool` and `nodepool_replicas < 2` are
+  rejected: the pinned module would otherwise plan a cluster with no workers.
+- These rules guard a **build**. `destroy` checks only what locates the
+  resources (names, subscription, region, backend), so a cluster built before
+  a rule existed can always be torn down without editing its config.
+
+A malformed or unreadable config file is a clean error naming the file. `.json`
+files are read as JSON, everything else as YAML.
 
 Config can also come from `ARO_*` environment variables (`ARO_CLUSTER_NAME`, …).
+Boolean variables accept `1/true/yes/on` and `0/false/no/off`; anything else is
+an error.
+
+`--cluster-name` (and the other overrides) re-derive every name that was not set
+explicitly — the vault, VNet, NSG and managed resource group follow the new
+cluster name.
+
+### Pull secret
+
+ARO HCP clusters are created with only the service's own registry
+credentials, so images from `registry.redhat.io` (OperatorHub, the sample
+image streams) cannot be pulled. Download your pull secret from
+[console.redhat.com](https://console.redhat.com/openshift/install/pull-secret)
+and point the config at it:
+
+```yaml
+pull_secret_path: ./pull-secret.json   # relative to this file; never commit it
+```
+
+Neither `az aro hcp cluster create` nor the cluster API accepts a pull secret.
+HyperShift merges a `kube-system/additional-pull-secret` Secret in the cluster
+into every node's credentials, so both backends add one as their last
+(`pull-secret`) phase: a 24-hour admin credential from `az aro hcp cluster
+request-credential --admin` is written to a private temporary file, the Secret
+is piped to `oc apply` (or `kubectl`) on stdin, and the file is removed. The
+terraform backend also passes the path to the module, which stores it in the
+Key Vault as `redhat-pull-secret`.
+
+- Needs `oc` or `kubectl` on PATH; preflight fails without one. With
+  `api_visibility: Private`, run apply from a network that reaches the API.
+- The secret never appears in argv, logs or the aro-hcp state file, which keeps
+  only its SHA-256: edit the file and re-run `apply` to rotate it. Terraform's
+  own state (and its `.backup`) does hold the Key Vault secret in plain text;
+  aro-hcp runs terraform with umask 077 so both are created `0600`, and
+  tightens older ones. Keep `.aro-hcp/` private and out of version control.
+- Teardown needs no file: the Secret goes with the cluster, and Terraform
+  purges the vault.
+
+### What the cluster does not include
+
+A cluster has **no identity provider** (the web console reports
+`OAuthClientSecretGetDegraded`), and no Red Hat pull secret unless you set
+`pull_secret_path`. Use `az aro hcp cluster request-credential --admin` for
+break-glass access, and configure external authentication separately.
 
 ## Agent mode
 
@@ -225,6 +378,23 @@ commands. It diagnoses failures against real Azure state, distinguishes a
 transient AD propagation lag from a permissions problem, and resumes.
 Without `--apply` it reviews the plan and reports risks without writing.
 
+The model is not the safety gate. Before an `--apply` run starts, the CLI runs
+the same checks as the equivalent command: preflight and the one-time
+confirmation for a build, the typed cluster name for `--destroy --apply`
+(`-y` skips the prompt; a non-interactive run without `-y` declines). The
+executor's dependency checks apply to the agent's tools too — it cannot purge
+the vault while the cluster exists. `inspect_azure` runs only an allowlist of
+read commands, refuses anything that can return secrets (Key Vault secrets,
+storage keys, credentials, tokens), `@file` arguments, `--debug`, and any
+subscription or resource group other than this cluster's, and redacts secret-looking values in what it returns. The exit
+code reflects the plan, not the model's last message: failed or pending steps,
+a refusal, or hitting `--max-turns` exit non-zero.
+
+The model defaults to `claude-opus-5`; set `--model` or `ARO_HCP_MODEL`. The
+SDK is pinned below 2.0: SDK 2.x's tool runner sends a field that
+Anthropic-compatible gateways (for example Vertex behind `ANTHROPIC_BASE_URL`)
+reject.
+
 `--destroy` points the same agent at the teardown plan, under a system prompt
 that holds the dependency order and refuses to reorder it:
 
@@ -236,6 +406,18 @@ aro-hcp agent --destroy --apply -c cluster.yaml    # tear down
 Inside Claude Code, use the bundled skill (`.claude/skills/provision-aro-hcp/`)
 instead — Claude is already the agent there, so it drives the deterministic
 subcommands directly and no API key is needed.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Done (for `--phase`, the selected phases are done) |
+| 1 | A step failed |
+| 2 | Config, state or argument problem; nothing ran |
+| 3 | Declined by the operator, or no TTY without `-y` |
+| 4 | Preflight blocked the run |
+| 5 | Nothing failed, but requested work is still pending (e.g. a cluster still provisioning) |
+| 130 | Interrupted; re-run the same command to resume |
 
 ## Development
 

@@ -9,8 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
-# Run state (captured resource IDs and step outcomes)
-.aro-hcp/
+# Run state: captured resource IDs, step outcomes, the module checkout and
+# Terraform's state, which holds Key Vault secret values (the pull secret) in
+# plain text. The glob also covers --state-dir variants such as .aro-hcp-test/.
+.aro-hcp*/
 
 # Test caches
 .pytest_cache/
@@ -19,3 +21,41 @@ wheels/
 # `aro-hcp init` writes cluster.yaml, which names real resources in a real
 # subscription and should not be shared by accident.
 cluster.yaml
+cluster-*.yaml
+*.cluster.yaml
+!cluster.example.yaml
+
+# Red Hat pull secrets (pull_secret_path). Credentials; never commit them.
+*pull-secret*
+*dockerconfigjson*
+*DockerConfigJSON*
+
+# Terraform files, if the module is ever run outside .aro-hcp/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+.terraform/
+crash.log
+
+# Cluster credentials (`az aro hcp cluster request-credential` writes these)
+kubeconfig
+*.kubeconfig
+.kube/
+
+# Other credentials
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+
+# Personal Claude Code settings (the shared skill under .claude/skills/ stays)
+.claude/settings.local.json
+
+# Tooling and OS noise
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.DS_Store

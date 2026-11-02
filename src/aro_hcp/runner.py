@@ -24,6 +24,51 @@ CommandResult = AzResult
 #: Terraform ``>= 1.9.0`` per the upstream module's required_version.
 MIN_TERRAFORM_VERSION = (1, 9, 0)
 
+#: Environment variables passed through to `terraform`, by exact name. The rest
+#: of the caller's environment is dropped: TF_CLI_ARGS*, TF_VAR_* and
+#: TF_WORKSPACE would otherwise widen or redirect an apply without appearing
+#: in the reviewed command line (D30, TF-21/23).
+_ENV_ALLOW = frozenset({
+    # process basics
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "NO_COLOR",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    # Windows equivalents of the above
+    "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "WINDIR",
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    # network: proxies and private CAs, without which providers cannot download
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # managed identity / workload identity endpoints for provider auth
+    "MSI_ENDPOINT", "MSI_SECRET", "IDENTITY_ENDPOINT", "IDENTITY_HEADER",
+    # Terraform operational settings that cannot change what is planned.
+    # TF_CLI_CONFIG_FILE stays: ~/.terraformrc is read via HOME regardless, and
+    # mirrors configured there are how air-gapped sites install providers.
+    "TF_LOG", "TF_LOG_PATH", "TF_LOG_CORE", "TF_LOG_PROVIDER",
+    "TF_PLUGIN_CACHE_DIR", "TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE",
+    "TF_CLI_CONFIG_FILE",
+})
+
+#: ...and by prefix: azurerm/azapi authentication (ARM_CLIENT_ID, ARM_USE_OIDC,
+#: ...) and the az CLI's own settings (AZURE_CONFIG_DIR), which the providers'
+#: default CLI authentication shells out to.
+_ENV_ALLOW_PREFIXES = ("ARM_", "AZURE_")
+
+#: Subcommands that do not take -no-color.
+_NO_COLOR_EXEMPT = frozenset({"version", "-version", "help", "-help", "fmt"})
+
+#: Subcommands whose second word is part of the command (`state list`).
+_NESTED = frozenset({"state", "workspace", "providers"})
+
+
+def _text(value) -> str:
+    """``TimeoutExpired.stdout`` is bytes even under ``text=True`` (O8)."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
 
 @runtime_checkable
 class Runner(Protocol):
@@ -90,12 +135,22 @@ class TerraformCli:
         """Return the full argv for a `terraform` invocation.
 
         ``-chdir`` is a global option and must precede the subcommand, which
-        is why it cannot simply be appended by the caller.
+        is why it cannot simply be appended by the caller. ``-no-color`` goes
+        straight after the subcommand: output is captured into logs, state
+        details and the agent's context, where ANSI escapes are noise (NFR-8).
         """
+        args = list(args)
+        if args and args[0] not in _NO_COLOR_EXEMPT and "-no-color" not in args:
+            words = 2 if (args[0] in _NESTED and len(args) > 1
+                          and not args[1].startswith("-")) else 1
+            args = [*args[:words], "-no-color", *args[words:]]
         return ["terraform", f"-chdir={self.module_dir}", *args]
 
     def environ(self) -> dict[str, str]:
-        env = dict(os.environ)
+        env = {
+            key: value for key, value in os.environ.items()
+            if key in _ENV_ALLOW or key.startswith(_ENV_ALLOW_PREFIXES)
+        }
         if self.subscription:
             env["ARM_SUBSCRIPTION_ID"] = self.subscription
         if self.data_dir:
@@ -133,9 +188,15 @@ class TerraformCli:
                 timeout=timeout,
                 check=False,
                 env=self.environ(),
+                # Terraform's state and its .backup hold every resource's
+                # attributes in plain text, Key Vault secret values included
+                # (the pull secret): create them private, like aro-hcp state.
+                **({"umask": 0o077} if os.name == "posix" else {}),
             )
         except subprocess.TimeoutExpired as exc:
-            result = CommandResult(argv, 124, exc.stdout or "", f"timed out after {timeout}s")
+            partial_err = _text(exc.stderr).strip()
+            message = f"timed out after {timeout}s" + (f"\n{partial_err}" if partial_err else "")
+            result = CommandResult(argv, 124, _text(exc.stdout), message)
             self._log.append(result)
             if check:
                 raise AzError(result) from exc
