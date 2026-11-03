@@ -100,6 +100,8 @@ _AUTO_VAR_GLOBS = ("*.auto.tfvars", "*.auto.tfvars.json")
 #: DELETE of the last node pool, so they are dropped from state before destroy
 #: and left for ARM to cascade when the cluster goes.
 _NODE_POOL_ADDRESS = re.compile(r'^module\.cluster\.azapi_resource\.node_pool(\[".+"\])?$')
+#: The same resource as a `terraform state list` filter (matches every instance).
+_NODE_POOL_STATE_ADDRESS = "module.cluster.azapi_resource.node_pool"
 
 #: Upstream defaults this backend overrides, with the reason, so the generated
 #: file explains itself to whoever reads it next.
@@ -941,7 +943,8 @@ def build_terraform_destroy_plan(
     paths = layout(config, directory)
 
     steps = _workspace_steps(paths, teardown=True)
-    steps.append(_init_step(paths, always=False))
+    # Every run: the probes below read Terraform's state through it.
+    steps.append(_init_step(paths))
     steps.append(
         Step(
             id="tf-state-rm-node-pools",
@@ -949,6 +952,10 @@ def build_terraform_destroy_plan(
             description="Remove node pools from Terraform state (OCPBUGS-86702)",
             args=["state-rm-node-pools"],
             action="state-rm-node-pools",
+            # A "done" mark, perhaps from an earlier lifecycle's teardown, is
+            # re-checked here: pools back in state mean this must run again,
+            # or the destroy below hits OCPBUGS-86702.
+            exists=["state", "list", _NODE_POOL_STATE_ADDRESS],
             runner="terraform",
             deletes=True,
             timeout=LONG_TIMEOUT,
@@ -968,6 +975,10 @@ def build_terraform_destroy_plan(
                 "destroy", "-input=false", "-auto-approve",
                 f"-var-file={paths.tfvars}",
             ],
+            # Anything left in Terraform's state still exists, so a recorded
+            # "done" is not trusted (D1 for this backend: a stale teardown
+            # state reported a rebuilt cluster torn down and deleted nothing).
+            exists=["state", "list"],
             runner="terraform",
             deletes=True,
             timeout=LONG_TIMEOUT,

@@ -385,14 +385,21 @@ def test_destroy_steps_are_marked_as_deletes():
 
 
 def test_dry_run_destroy_deletes_nothing(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        subprocess, "run",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("spawned a process")),
-    )
+    spawned = []
+
+    def only_reads(argv, *_a, **_k):
+        # The probes read Terraform's state; nothing else may run.
+        spawned.append(argv)
+        if "state" in argv and "list" in argv:
+            return subprocess.CompletedProcess(argv, 0, 'module.cluster.azapi_resource.node_pool["np-1"]\n', "")
+        raise AssertionError(f"spawned {argv}")
+
+    monkeypatch.setattr(subprocess, "run", only_reads)
     executor = make_executor(tmp_path, destroy=True)
     for step in executor.plan:
         if step.phase in ("nodepool-state", "destroy"):
             assert executor.run_step(step).status == "pending"
+    assert spawned and all("list" in argv for argv in spawned)
 
 
 def test_node_pool_address_pattern_matches_upstream_state_addresses():

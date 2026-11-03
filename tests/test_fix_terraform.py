@@ -825,3 +825,92 @@ def test_existing_state_files_are_made_private(tmp_path):
     tf_mod.action_write_tfvars(executor, step(executor, "tf-write-tfvars"))
     assert oct(paths.tfstate.stat().st_mode & 0o777) == "0o600"
     assert oct(paths.tfstate.with_name(paths.tfstate.name + ".backup").stat().st_mode & 0o777) == "0o600"
+
+
+# -- found live on main: a stale teardown state skipped a rebuilt cluster ---------
+
+
+class StatefulTF(Fake):
+    """`terraform state list/rm` and `destroy` against an in-memory state."""
+
+    def __init__(self, resources=None, no_state=False):
+        super().__init__()
+        self.resources = list(resources or [])
+        self.no_state = no_state
+
+    def run(self, args, *, check=True, timeout=0, force=False):
+        argv = list(args)
+        self.calls.append(argv)
+        if argv[:2] == ["state", "list"]:
+            # What terraform 1.13 really answers (checked live).
+            if self.no_state:
+                return AzResult(argv, 1, "", "No state file was found!\n\nState management "
+                                             "commands require a state file.")
+            wanted = argv[2] if len(argv) > 2 else ""
+            matched = [r for r in self.resources if r.startswith(wanted)]
+            if wanted and not matched:
+                return AzResult(argv, 1, "", f"\nError: Unknown resource\n\nThe current state "
+                                             f"contains no resource\n{wanted}. If you've just "
+                                             "added this resource...")
+            return AzResult(argv, 0, "\n".join(matched), "")
+        if argv[:2] == ["state", "rm"]:
+            self.resources.remove(argv[2])
+            return AzResult(argv, 0, "Removed 1", "")
+        if argv[:1] == ["destroy"]:
+            self.resources.clear()
+            return AzResult(argv, 0, "Destroy complete!", "")
+        return AzResult(argv, 0, "", "")
+
+
+BUILT = ['module.cluster.azapi_resource.node_pool["np-1"]',
+         "module.cluster.azapi_resource.hcp_cluster",
+         "module.network.azurerm_resource_group.this"]
+
+
+def _stale_teardown(tmp_path, monkeypatch, tf):
+    ok = lambda ex, s: AzResult(s.render(ex.context), 0, "ok", "")  # noqa: E731
+    monkeypatch.setitem(tf_mod.ACTIONS, "fetch-module", ok)
+    monkeypatch.setitem(tf_mod.ACTIONS, "write-tfvars", ok)
+    executor = make_executor(tmp_path, tf=tf, destroy=True)
+    for s in executor.plan:  # every step "done" by an earlier lifecycle's teardown
+        executor.state.record(s.id, "done")
+    return executor
+
+
+def test_stale_teardown_state_does_not_skip_a_rebuilt_cluster(tmp_path, monkeypatch):
+    tf = StatefulTF(BUILT)
+    executor = _stale_teardown(tmp_path, monkeypatch, tf)
+    outcomes = {o.step.id: o.status for o in executor.run_all()}
+    assert outcomes["tf-state-rm-node-pools"] == "done"
+    assert outcomes["tf-destroy"] == "done"
+    assert ["destroy"] == [c[0] for c in tf.calls if c[:1] == ["destroy"]]
+    assert tf.resources == []
+    # The pools left state before the destroy ran (OCPBUGS-86702).
+    rm = next(i for i, c in enumerate(tf.calls) if c[:2] == ["state", "rm"])
+    assert rm < next(i for i, c in enumerate(tf.calls) if c[:1] == ["destroy"])
+
+
+def test_stale_teardown_state_with_nothing_in_terraform_state_is_verified(tmp_path, monkeypatch):
+    tf = StatefulTF([])
+    executor = _stale_teardown(tmp_path, monkeypatch, tf)
+    outcomes = {o.step.id: o.status for o in executor.run_all()}
+    assert outcomes["tf-destroy"] == "skipped" and not [c for c in tf.calls if c[:1] == ["destroy"]]
+
+
+def test_no_terraform_state_at_all_means_nothing_to_destroy(tmp_path, monkeypatch):
+    tf = StatefulTF(no_state=True)
+    ok = lambda ex, s: AzResult(s.render(ex.context), 0, "ok", "")  # noqa: E731
+    monkeypatch.setitem(tf_mod.ACTIONS, "fetch-module", ok)
+    monkeypatch.setitem(tf_mod.ACTIONS, "write-tfvars", ok)
+    executor = make_executor(tmp_path, tf=tf, destroy=True)
+    outcomes = {o.step.id: o.status for o in executor.run_all()}
+    assert outcomes["tf-destroy"] == "skipped"
+
+
+def test_every_teardown_delete_can_be_reverified():
+    from aro_hcp.destroy import build_destroy_plan
+    plans = [build_terraform_destroy_plan(make_config()),
+             build_destroy_plan(make_config(backend="az-cli")),
+             build_destroy_plan(make_config(backend="az-cli", keyvault_private_endpoint=True))]
+    unprobed = [s.id for plan in plans for s in plan if s.deletes and s.exists is None]
+    assert not unprobed, "a recorded delete without a probe is trusted forever (D1)"

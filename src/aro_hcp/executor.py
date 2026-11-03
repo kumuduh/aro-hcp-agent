@@ -44,6 +44,10 @@ _NOT_FOUND = (
     "could not be found",
     "was not found",
     "does not exist",
+    # `terraform state list` with no state yet, and `state list <address>`
+    # when nothing in the state matches: nothing to remove or destroy.
+    "No state file was found",
+    "The current state contains no resource",
 )
 
 #: Errors about the lookup's scope (subscription, resource type, provider),
