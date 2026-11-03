@@ -72,6 +72,11 @@ reported as provisioned. An existence check that fails for any reason other
 than "not found" (403, throttling, timeout) stops the step; it is never read as
 "absent".
 
+Teardown works the same way: a delete recorded as done (perhaps by the
+teardown of an earlier cluster with the same name) is re-checked before it is
+skipped. On the terraform backend the check is Terraform's own state, so
+anything still listed there is destroyed again rather than assumed gone.
+
 The state file is bound to its cluster, subscription and the settings it was
 built with. Pointing `--state` at another cluster's file, or changing the
 region, network prefixes, versions or node pool after a partial build, is

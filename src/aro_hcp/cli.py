@@ -632,6 +632,11 @@ def cmd_destroy(args: argparse.Namespace) -> int:
         if args.verbose:
             print(f"        {command}")
 
+    if any(status in (state_mod.DONE, state_mod.SKIPPED) for _s, status, _c in rows):
+        # A "done" here can be left over from an earlier lifecycle; it must
+        # not read as "nothing left to delete".
+        print("\n[done] marks come from the teardown state file. --apply re-checks each "
+              "against Azure (and Terraform's state) and deletes whatever still exists.")
     if not args.apply:
         print("\nNothing was deleted. Re-run with --apply to execute.")
         return EXIT_OK
