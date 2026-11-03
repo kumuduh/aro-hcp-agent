@@ -395,6 +395,7 @@ def test_dry_run_destroy_deletes_nothing(tmp_path, monkeypatch):
         raise AssertionError(f"spawned {argv}")
 
     monkeypatch.setattr(subprocess, "run", only_reads)
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/terraform")  # CI has none
     executor = make_executor(tmp_path, destroy=True)
     for step in executor.plan:
         if step.phase in ("nodepool-state", "destroy"):
