@@ -13,6 +13,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from fake_tokens import JWT_FRAGMENT, JWT_HEADER, b64
 
 anthropic = pytest.importorskip("anthropic")
 
@@ -214,12 +215,12 @@ def test_redact_json_keys_and_text_patterns():
         "name": "demo-cluster-control-plane-cluster-api-azure-identity",
         "primaryKey": "SENTINEL-PRIMARY==",
         "connectionString": "DefaultEndpointsProtocol=https;AccountKey=SENTINEL-AK==",
-        "accessToken": "eyJ0eXAiOiJKV1QiSENTINEL",
+        "accessToken": JWT_FRAGMENT,
         "properties": {
             "clientSecret": "SENTINEL-CS",
             "activeKey": {"name": "etcd-kms-key", "vaultName": "demo-kv"},
-            "notes": "sig=SENTINEL-SIG&se=2026 Bearer eyJhbGciOiJSUzI1NiJ9.SENTINELpayload.x",
-            "blob": "Q2xhdWRlU0VOVElORUwxMjM0NTY3ODkwYWJjZGVmZ2hpams=",
+            "notes": f"sig=SENTINEL-SIG&se=2026 Bearer {JWT_HEADER}.SENTINELpayload.x",
+            "blob": b64(b"ClaudeSENTINEL1234567890abcdefghijk"),
         },
     }
     out = redact(json.dumps(payload))
@@ -231,14 +232,14 @@ def test_redact_json_keys_and_text_patterns():
 
 
 def test_redact_plain_text():
-    out = redact("ERROR: AccountKey=SENTINEL123== rejected; token eyJ0eXAiOiJKV1QiSENTINEL")
+    out = redact(f"ERROR: AccountKey=SENTINEL123== rejected; token {JWT_FRAGMENT}")
     assert "SENTINEL" not in out
     assert "ERROR" in out
 
 
 def test_inspect_output_is_redacted(tmp_path):
     az = RecordingAz(stdout=json.dumps({"password": "SENTINEL-PW"}),
-                     stderr="Bearer eyJ0eXAiOiJKV1QiSENTINEL")
+                     stderr=f"Bearer {JWT_FRAGMENT}")
     result, _ = inspect(tmp_path, "group show --name demo-rg", az=az)
     assert "SENTINEL" not in result
 

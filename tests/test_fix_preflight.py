@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 import pytest
+from fake_tokens import JWT_HEADER
 
 from aro_hcp import preflight
 from aro_hcp.azure import AzCli, AzResult, token_object_id
@@ -106,7 +107,7 @@ MI_OID = "11111111-2222-3333-4444-555555555555"
 
 def jwt(claims):
     body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-    return f"eyJhbGciOiJSUzI1NiJ9.{body}.signature"
+    return f"{JWT_HEADER}.{body}.signature"
 
 
 @pytest.mark.parametrize("literal", ["systemAssignedIdentity", "userAssignedIdentity"])
