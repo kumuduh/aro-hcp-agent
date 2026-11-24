@@ -11,6 +11,7 @@ import json
 import sys
 
 import pytest
+from fake_tokens import fake_jwt
 
 from aro_hcp import cli
 from aro_hcp import state as state_mod
@@ -467,7 +468,7 @@ def test_delete_timeout_while_still_present_is_in_progress(tmp_path):
 
 def test_bearer_tokens_and_jwts_are_redacted():
     from aro_hcp.state import redact
-    jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4eHh4eHh4In0.c2lnbmF0dXJlc2lnbmF0dXJl"
+    jwt = fake_jwt()
     out = redact(f"Authorization: Bearer abc.def.ghi and {jwt}")
     assert "abc.def.ghi" not in out and jwt not in out
 
